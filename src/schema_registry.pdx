@@ -266,4 +266,213 @@ module SchemaRegistry = structure {
         ret;
       }
     }
+
+  // ============================================================================
+  // schema_lookup(fqname_ptr, fqname_len,
+  //               out_id_ptr, out_hash_ptr,
+  //               out_body_ptr_ptr, out_body_len_ptr) -> u64
+  //
+  //   rdi = fqname_ptr         (query)
+  //   rsi = fqname_len         (query byte-length; must be in [1, 64])
+  //   rdx = out_id_ptr         (nullable; NULL to skip)
+  //   rcx = out_hash_ptr       (nullable; NULL to skip)
+  //   r8  = out_body_ptr_ptr   (nullable; NULL to skip)
+  //   r9  = out_body_len_ptr   (nullable; NULL to skip)
+  //
+  //   rax = SR_OK              on hit (out-parameters populated)
+  //       | SR_ERR_NULL_NAME   (1) if fqname_ptr == 0
+  //       | SR_ERR_NAME_RANGE  (2) if fqname_len 0 or > SR_MAX_FQNAME_LEN
+  //       | SR_ERR_NOT_FOUND   (5) on miss (no slot's fqname matches)
+  //
+  // Behavior:
+  //   1. Gate query args (null/range) — no state touched on failure.
+  //   2. Linear-scan schema_slot_state; for each OCCUPIED slot with
+  //      matching fqname_len, byte-compare against the slot's
+  //      fqname bytes; the first match wins (dedup at register time
+  //      makes duplicate matches impossible for register-through-this-
+  //      library callers, but M3-003 wire-mode consumers could in
+  //      principle race — first match keeps the semantics stable).
+  //   3. On hit: for each non-null out-parameter, write the
+  //      corresponding slot field (id, content_hash, body_ptr,
+  //      body_len). NULL-tolerant per out-parameter so a caller who
+  //      only wants the id passes 0 for the other three.
+  //
+  // Register plan (5-push prologue = 40 bytes → rsp % 16 = 0 for any
+  // hypothetical future nested call; today the function is a pure leaf
+  // with no CALL inside so alignment is not observed):
+  //   rbx = fqname_ptr         (input; preserved across byte-compare)
+  //   r12 = fqname_len         (input; preserved)
+  //   r13 = out_id_ptr
+  //   r14 = out_hash_ptr
+  //   r15 = out_body_ptr_ptr
+  //   r9  = out_body_len_ptr   (leaf-preserved caller-save — no nested
+  //                             call touches it)
+  //   rcx = outer scan counter i
+  //   rdi = inner byte-compare index j (repurposed after the copy)
+  //   r8  = slot's fqname_ptr scratch (repurposed after the copy)
+  //   rax = load / return
+  //   rsi, rdx = byte-load scratch inside the compare
+  //   r10, r11 = pointer arithmetic scratch (base + i*8)
+  //
+  // Effects `!{mem} @{}` — pure library-owned read; no syscall.
+  // ============================================================================
+
+  pub let schema_lookup : (u64, u64, u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (fqname_ptr: u64) (fqname_len: u64)
+       (out_id_ptr: u64) (out_hash_ptr: u64)
+       (out_body_ptr_ptr: u64) (out_body_len_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-schema-registry.M2-003: schema_lookup entry point. Inline pre-prologue gates (avoid a push/pop dance on early error): fqname_ptr == 0 → SR_ERR_NULL_NAME (1); fqname_len == 0 OR > SR_MAX_FQNAME_LEN (64) → SR_ERR_NAME_RANGE (2). 5-push prologue (rbx / r12 / r13 / r14 / r15) copies input pointers into callee-save regs so the outer scan counter (rcx) does not clobber out_hash_ptr (rcx on entry). out_body_len_ptr in r9 stays put — caller-save r9 survives a leaf's execution untouched. Outer scan: xor rcx,rcx; while rcx < 32 (SR_MAX_SCHEMAS): (a) load schema_slot_state[i] via `lea r11,[rip+schema_slot_state]; mov r10,rcx; shl r10,3; add r10,r11; mov rax,[r10]`; skip if != SR_SLOT_OCCUPIED (1); (b) load schema_fqname_len[i]; skip if != r12; (c) load schema_fqname_ptr[i] into r8. Inner byte-compare: xor rdi,rdi (j = 0); while rdi < r12: byte-load caller[j] into rsi and slot[j] into rdx via the `xor sink; mov_b sink,[base + rdi*1]` #1248 mitigation shape (paideia-as SIB folding needs the explicit *1 scale on the index); on cmp rsi,rdx mismatch break to next outer slot; else advance rdi. When the inner loop finishes (rdi == r12), the fqname matched — write outs. NULL-tolerant per-out: `cmp r13,0; je snl_skip_id ; ... mov [r13],rax ; snl_skip_id:` (and analogous for r14/r15/r9); each write loads the corresponding slot array via the same lea+shl+add idiom. Then rax = SR_OK (0), pop the five callee-saves, ret. Miss: after the outer loop exhausts, rax = SR_ERR_NOT_FOUND (5), pop, ret. Every branch uses cmp+jne/je/jae/jb — no test mnemonic. Immediates: 0 (null-check + SR_OK + SR_SLOT_EMPTY compare), 1 (SR_ERR_NULL_NAME / SR_SLOT_OCCUPIED), 2 (SR_ERR_NAME_RANGE), 3 (shl bit count), 5 (SR_ERR_NOT_FOUND), 32 (SR_MAX_SCHEMAS), 64 (SR_MAX_FQNAME_LEN) — all imm8. Label prefix snl_ per project reserved-label discipline.",
+      block: {
+        // ---- Argument gates (pre-prologue, no push/pop). --------------
+        cmp rdi, 0;
+        je snl_null_name;
+
+        cmp rsi, 0;
+        je snl_name_range;
+        cmp rsi, 64;                             // SR_MAX_FQNAME_LEN
+        ja snl_name_range;
+
+        // ---- Prologue: move args into callee-saves. -------------------
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;                            // fqname_ptr
+        mov r12, rsi;                            // fqname_len
+        mov r13, rdx;                            // out_id_ptr
+        mov r14, rcx;                            // out_hash_ptr
+        mov r15, r8;                             // out_body_ptr_ptr
+        // r9 = out_body_len_ptr already, no move needed.
+
+        // ---- Outer scan. ---------------------------------------------
+        xor rcx, rcx;                            // i = 0
+
+      snl_outer_head:
+        cmp rcx, 32;                             // SR_MAX_SCHEMAS
+        jae snl_miss;
+
+        // schema_slot_state[i]
+        lea r11, [rip + schema_slot_state];
+        mov r10, rcx;
+        shl r10, 3;
+        add r10, r11;
+        mov rax, [r10];
+        cmp rax, 1;                              // SR_SLOT_OCCUPIED
+        jne snl_outer_advance;
+
+        // schema_fqname_len[i]
+        lea r11, [rip + schema_fqname_len];
+        mov r10, rcx;
+        shl r10, 3;
+        add r10, r11;
+        mov rax, [r10];
+        cmp rax, r12;
+        jne snl_outer_advance;
+
+        // schema_fqname_ptr[i] into r8
+        lea r11, [rip + schema_fqname_ptr];
+        mov r10, rcx;
+        shl r10, 3;
+        add r10, r11;
+        mov r8, [r10];
+
+        // ---- Inner byte-compare loop. ------------------------------
+        xor rdi, rdi;                            // j = 0
+
+      snl_inner_head:
+        cmp rdi, r12;
+        jae snl_hit;
+
+        xor rsi, rsi;
+        mov_b rsi, [rbx + rdi * 1];              // caller byte
+
+        xor rdx, rdx;
+        mov_b rdx, [r8 + rdi * 1];               // slot byte
+
+        cmp rsi, rdx;
+        jne snl_outer_advance;
+
+        add rdi, 1;
+        jmp snl_inner_head;
+
+      snl_outer_advance:
+        add rcx, 1;
+        jmp snl_outer_head;
+
+      snl_hit:
+        // ---- NULL-tolerant per-out writes. --------------------------
+
+        // *out_id_ptr = schema_id[i]
+        cmp r13, 0;
+        je snl_skip_id;
+        lea r11, [rip + schema_id];
+        mov r10, rcx;
+        shl r10, 3;
+        add r10, r11;
+        mov rax, [r10];
+        mov [r13], rax;
+
+      snl_skip_id:
+        // *out_hash_ptr = schema_content_hash[i]
+        cmp r14, 0;
+        je snl_skip_hash;
+        lea r11, [rip + schema_content_hash];
+        mov r10, rcx;
+        shl r10, 3;
+        add r10, r11;
+        mov rax, [r10];
+        mov [r14], rax;
+
+      snl_skip_hash:
+        // *out_body_ptr_ptr = schema_body_ptr[i]
+        cmp r15, 0;
+        je snl_skip_body_ptr;
+        lea r11, [rip + schema_body_ptr];
+        mov r10, rcx;
+        shl r10, 3;
+        add r10, r11;
+        mov rax, [r10];
+        mov [r15], rax;
+
+      snl_skip_body_ptr:
+        // *out_body_len_ptr = schema_body_len[i]
+        cmp r9, 0;
+        je snl_skip_body_len;
+        lea r11, [rip + schema_body_len];
+        mov r10, rcx;
+        shl r10, 3;
+        add r10, r11;
+        mov rax, [r10];
+        mov [r9], rax;
+
+      snl_skip_body_len:
+        xor rax, rax;                            // SR_OK
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      snl_miss:
+        mov rax, 5;                              // SR_ERR_NOT_FOUND
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      snl_null_name:
+        mov rax, 1;                              // SR_ERR_NULL_NAME
+        ret;
+
+      snl_name_range:
+        mov rax, 2;                              // SR_ERR_NAME_RANGE
+        ret;
+      }
+    }
 }

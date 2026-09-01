@@ -1,4 +1,4 @@
-// src/schema_record.pdx — libpdx-schema-registry.M2-001
+// src/schema_record.pdx — libpdx-schema-registry.M2-001 + M3-002
 // SchemaRecord: singleton .bss storage for the per-process schema catalog.
 //
 // This library is the client-side facade the plan doc §4 describes: an
@@ -69,6 +69,24 @@ module SchemaRecord = structure {
   pub let SR_MAX_SCHEMAS    : u64 = 32
   pub let SR_MAX_FQNAME_LEN : u64 = 64
 
+  // --- M3-002 authorization bit. R_SCHEMA_REGISTER (0x40, bit 6) is
+  //     the cap-mask bit R90-XREPO.012 reserves for the "may mutate the
+  //     schema catalog" grant that libpdx-elevate mints via
+  //     elevate_client_acquire. The bit sits in the low byte (bits 0..7)
+  //     of the elevate cap mask (libpdx-elevate's
+  //     elevate_request_cap_mask_valid enforces "no reserved bits (8..63)
+  //     set") — bit 6 is chosen because paideia-os's other satellite
+  //     R_* bits at time of writing occupy bits 0..5 (R_FS_ADMIN,
+  //     R_NET_PRIVILEGED_PROTOCOL, R_ELEVATE_JOURNAL_READ,
+  //     R_SYSTEM_PATH_WRITE, R_PKG_INSTALL, R_ACCT_MUTATE per the
+  //     R48/R49/R50 wave docs) and bit 7 is left as a spare for the
+  //     next round. schema_registry_arm gates on
+  //     (cap_mask & R_SCHEMA_REGISTER) != 0 rather than a plain
+  //     nonzero-mask check so a caller who accidentally arms with the
+  //     wrong grant class (say, R_PKG_INSTALL) still gets
+  //     SR_ERR_UNAUTHORIZED.
+  pub let R_SCHEMA_REGISTER : u64 = 0x40
+
   // --- Content-hash primitive constants. FNV-1a-64 placeholder — same
   //     primitive choice libpdx-audit made at M3-001 pending BLAKE3 as
   //     a paideia-as stdlib intrinsic. Both constants are load-only
@@ -117,6 +135,22 @@ module SchemaRecord = structure {
   pub let mut schema_hash_state   : u64       = uninit @align(8)
   pub let mut schema_hash_active  : u64       = uninit @align(8)
 
+  // --- M3-002 authorization flag. schema_register consults this in its
+  //     pre-prologue gate chain: 0 (default, .bss zero-init) → refuse
+  //     with SR_ERR_UNAUTHORIZED; nonzero → proceed. Read-side ops
+  //     (schema_lookup, schema_list) never consult this — the plan
+  //     treats the catalog as public-read, restricted-write.
+  //
+  //     Callers acquire an elevate grant carrying R_SCHEMA_REGISTER in
+  //     the cap mask (typically via libpdx-elevate's
+  //     elevate_client_acquire), then call SchemaRegistry::
+  //     schema_registry_arm(cap_mask); on the grant's expiry side they
+  //     call schema_registry_disarm() to clear the flag. Persisting the
+  //     armed state past the grant's expiration is the caller's
+  //     responsibility — this library holds no timer machinery of its
+  //     own, matching libpdx-audit's stance on lifetime tracking.
+  pub let mut schema_registry_authorized : u64 = uninit @align(8)
+
   // reset() — bootstrap init. Zeros every slot's state array to
   // SR_SLOT_EMPTY (already the .bss default; explicit here so a
   // defensive re-init after fork or a supervisor teardown restores the
@@ -138,7 +172,7 @@ module SchemaRecord = structure {
   pub let reset : () -> () !{mem} @{} =
     fn () -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-schema-registry.M2-001: reset entry point. Zeros schema_slot_state[0..SR_MAX_SCHEMAS) via the per-slot RIP-relative array-write idiom libpdx-semantic-pipe uses in Binding::reset — lea r11,[rip+base] once, then per iteration: mov r10,rcx; shl r10,3; add r10,r11; mov [r10],rax. paideia-as does not emit scale-index [base+idx*8] addressing so the explicit shl+add is the compliant form. Loop bound compared against SR_MAX_SCHEMAS = 32 (imm8). After the loop, seeds schema_id_next = 1 (mov rax,1; lea r11,[rip+schema_id_next]; mov [r11],rax) so the first schema_register call in a process hands out id 1, leaving id 0 as the reserved 'no schema' sentinel — parallels libpdx-audit's audit_id_next seeding at reset. Also zeros schema_hash_state / schema_hash_active so a fresh reset gives schema_hash_init a clean starting point (rather than inheriting a hash-in-flight from a prior register within the same process). No test mnemonic — every zero-check uses cmp reg, 0. Immediates 0 / 1 / 32 all fit imm8, well within paideia-as cmp-imm bounds. Register plan: rax = fill value (0, then 1 for the id_next seed), rcx = loop counter i in [0, 32), r10 = per-slot pointer scratch (base + i*8), r11 = &schema_slot_state base for the loop and a second RIP-relative LEA target for schema_id_next / schema_hash_state / schema_hash_active. Leaf function — no callee-save touched, no push/pop.",
+      justification: "libpdx-schema-registry.M2-001 + M3-002: reset entry point. Zeros schema_slot_state[0..SR_MAX_SCHEMAS) via the per-slot RIP-relative array-write idiom libpdx-semantic-pipe uses in Binding::reset — lea r11,[rip+base] once, then per iteration: mov r10,rcx; shl r10,3; add r10,r11; mov [r10],rax. paideia-as does not emit scale-index [base+idx*8] addressing so the explicit shl+add is the compliant form. Loop bound compared against SR_MAX_SCHEMAS = 32 (imm8). After the loop, seeds schema_id_next = 1 so the first schema_register call in a process hands out id 1, leaving id 0 as the reserved 'no schema' sentinel — parallels libpdx-audit's audit_id_next seeding at reset. Also zeros schema_hash_state / schema_hash_active (M2-002 accumulator baseline) and schema_registry_authorized (M3-002 fail-closed on every re-init — a caller must re-arm via schema_registry_arm after reset). No test mnemonic — every zero-check uses cmp reg, 0. Immediates 0 / 1 / 32 all fit imm8, well within paideia-as cmp-imm bounds. Register plan: rax = fill value (0, then 1 for the id_next seed), rcx = loop counter i in [0, 32), r10 = per-slot pointer scratch (base + i*8), r11 = &schema_slot_state base for the loop and a second RIP-relative LEA target for the singleton .bss slots. Leaf function — no callee-save touched, no push/pop.",
       block: {
         // ---- Zero the schema_slot_state array. ------------------------
         xor rax, rax;                            // rax = 0 (fill value)
@@ -162,6 +196,11 @@ module SchemaRecord = structure {
         lea r11, [rip + schema_hash_state];
         mov [r11], rax;
         lea r11, [rip + schema_hash_active];
+        mov [r11], rax;
+
+        // ---- M3-002: zero the authorization flag (fail-closed on
+        //      every re-init; a caller must re-arm after reset). ------
+        lea r11, [rip + schema_registry_authorized];
         mov [r11], rax;
 
         // ---- Seed schema_id_next = 1 (id 0 reserved as sentinel). ----

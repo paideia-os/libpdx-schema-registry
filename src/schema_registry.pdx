@@ -1,4 +1,4 @@
-// src/schema_registry.pdx — libpdx-schema-registry.M2-002 + M2-003 + M2-004 + M3-001
+// src/schema_registry.pdx — libpdx-schema-registry.M2-002 + M2-003 + M2-004 + M3-001 + M3-002
 // SchemaRegistry: the client-side register/lookup/list API landed one
 // milestone at a time. This file lands M2-002 (schema_register), M2-003
 // (schema_lookup), M2-004 (schema_list), and M3-001 (audit-first gate
@@ -100,6 +100,18 @@ module SchemaRegistry = structure {
         ret;
 
       snr_audit_ok:
+        // ---- Gate 0.5 (M3-002): authorization must be armed. ---------
+        //      schema_registry_authorized is a SchemaRecord .bss slot;
+        //      schema_registry_arm sets it to 1 after checking the
+        //      caller's cap mask carries R_SCHEMA_REGISTER.
+        lea r11, [rip + schema_registry_authorized];
+        mov rax, [r11];
+        cmp rax, 0;
+        jne snr_auth_ok;
+        mov rax, 7;                              // SR_ERR_UNAUTHORIZED
+        ret;
+
+      snr_auth_ok:
         // ---- Argument gates (pre-prologue, no push/pop required). ----
         cmp rdi, 0;
         je snr_null_name;
@@ -491,6 +503,104 @@ module SchemaRegistry = structure {
 
       snl_name_range:
         mov rax, 2;                              // SR_ERR_NAME_RANGE
+        ret;
+      }
+    }
+
+  // ============================================================================
+  // schema_registry_arm(cap_mask) -> u64
+  //   rdi = cap_mask   (u64 elevate cap mask the caller acquired via
+  //                     libpdx-elevate's elevate_client_acquire; must
+  //                     carry R_SCHEMA_REGISTER = 0x40 in the low byte
+  //                     for the arm to take effect)
+  //   rax = SR_OK               on successful arm (flag set to 1)
+  //       | SR_ERR_UNAUTHORIZED (7) if (cap_mask & R_SCHEMA_REGISTER)
+  //                                  is zero
+  //
+  // M3-002 entry point. Callers thread the cap mask returned by
+  // libpdx-elevate through here before their first schema_register
+  // call and again after any subsequent grant refresh; the flag stays
+  // set until schema_registry_disarm() (or SchemaRecord::reset()).
+  //
+  // No timer machinery — the caller owns lifetime tracking against the
+  // elevate grant's expire_ns. On expiration the caller must call
+  // schema_registry_disarm() to fail-close the flag.
+  //
+  // Pure leaf; no callee-save touched, no nested call.
+  // ============================================================================
+
+  pub let schema_registry_arm : (u64) -> u64 !{mem} @{} =
+    fn (cap_mask: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-schema-registry.M3-002: schema_registry_arm entry point. Gate: (rdi & R_SCHEMA_REGISTER) via `and rax,0x40; cmp rax,0; je snra_unauth` — an AND-then-compare sequence rather than the missing `test reg,imm` mnemonic paideia-as does not emit; the AND clobbers rax but that is fine because rax is the return register and the branch decides the return value. R_SCHEMA_REGISTER (0x40 = bit 6) is an imm8 well within the 0x7FFFFFFF cmp/and imm bound. On the bit-clear path: rax = SR_ERR_UNAUTHORIZED (7), return. On the bit-set path: store 1 at schema_registry_authorized via lea+mov, rax = SR_OK (0), return. Pure leaf; no callee-save touched, no push/pop, no nested call. Register plan: rax = AND scratch / return, rdi = cap_mask arg, r11 = LEA scratch. Effects `!{mem} @{}` — pure .bss write, no syscall. Label prefix snra_ per project reserved-label discipline.",
+      block: {
+        mov rax, rdi;                            // rax = cap_mask
+        and rax, 0x40;                           // rax = cap_mask & R_SCHEMA_REGISTER
+        cmp rax, 0;
+        je snra_unauth;
+
+        mov rax, 1;
+        lea r11, [rip + schema_registry_authorized];
+        mov [r11], rax;
+
+        xor rax, rax;                            // SR_OK
+        ret;
+
+      snra_unauth:
+        mov rax, 7;                              // SR_ERR_UNAUTHORIZED
+        ret;
+      }
+    }
+
+  // ============================================================================
+  // schema_registry_disarm() -> ()
+  //
+  // Clears schema_registry_authorized to 0 so subsequent schema_register
+  // calls will refuse with SR_ERR_UNAUTHORIZED until schema_registry_arm
+  // is called again. Callers invoke this on the elevate grant's expire
+  // side (or on any transition that surrenders the R_SCHEMA_REGISTER
+  // authority).
+  //
+  // Pure leaf; no callee-save touched.
+  // ============================================================================
+
+  pub let schema_registry_disarm : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-schema-registry.M3-002: schema_registry_disarm entry point. Single .bss write: schema_registry_authorized = 0 via `xor rax,rax; lea r11,[rip+schema_registry_authorized]; mov [r11],rax`. Pure leaf; no callee-save touched, no push/pop, no nested call. Register plan: rax = 0 (fill value), r11 = LEA scratch. Effects `!{mem} @{}` — pure .bss write, no syscall.",
+      block: {
+        xor rax, rax;
+        lea r11, [rip + schema_registry_authorized];
+        mov [r11], rax;
+        ret;
+      }
+    }
+
+  // ============================================================================
+  // schema_registry_is_armed() -> u64
+  //   rax = 1 iff schema_registry_authorized is nonzero (register would
+  //         proceed past the M3-002 auth gate); 0 otherwise.
+  //
+  // Diagnostic accessor — a caller can consult this before attempting a
+  // register to decide whether an elevate re-acquisition is needed.
+  // Returns the raw flag value; nonzero maps to 1 by the `cmp; je`
+  // canonicalization so callers can use it as a plain boolean.
+  // ============================================================================
+
+  pub let schema_registry_is_armed : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-schema-registry.M3-002: schema_registry_is_armed accessor. One .bss load then canonicalize-to-{0,1}: `lea r11,[rip+schema_registry_authorized]; mov rax,[r11]; cmp rax,0; jne snraq_yes; xor rax,rax; ret; snraq_yes: mov rax,1; ret`. Pure leaf; no callee-save touched, no push/pop. Register plan: rax = load / return, r11 = LEA scratch. Effects `!{mem} @{}` — pure .bss read. Label prefix snraq_ per project reserved-label discipline.",
+      block: {
+        lea r11, [rip + schema_registry_authorized];
+        mov rax, [r11];
+        cmp rax, 0;
+        jne snraq_yes;
+        xor rax, rax;
+        ret;
+
+      snraq_yes:
+        mov rax, 1;
         ret;
       }
     }

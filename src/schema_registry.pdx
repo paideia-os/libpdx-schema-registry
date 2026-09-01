@@ -1,9 +1,11 @@
-// src/schema_registry.pdx — libpdx-schema-registry.M2-002
+// src/schema_registry.pdx — libpdx-schema-registry.M2-002 + M2-003 + M2-004 + M3-001
 // SchemaRegistry: the client-side register/lookup/list API landed one
-// milestone at a time. This file lands M2-002 (schema_register); M2-003
-// (schema_lookup) and M2-004 (schema_list) extend it in place; M3-001
-// (audit hook) and M3-002 (elevate gate) extend schema_register in
-// place with additional prelude gates.
+// milestone at a time. This file lands M2-002 (schema_register), M2-003
+// (schema_lookup), M2-004 (schema_list), and M3-001 (audit-first gate
+// on register — refuses when the caller has no libpdx-audit record
+// open, per the D3 / I5 discipline the plan doc pins on any operation
+// that mutates persistent state); M3-002 (elevate gate) extends
+// schema_register in place with an additional prelude gate.
 //
 // paideia-as conformance:
 //   - Module basename PascalCase; no directory prefix.
@@ -24,10 +26,13 @@
 //   schema_body_ptr[i], schema_body_len[i], schema_id_next
 // Cross-module functions called (all in SchemaHash):
 //   schema_hash_init, schema_hash_update, schema_hash_finalize
+// Cross-module symbols read (M3-001, libpdx-audit AuditRecord .bss):
+//   record_state — resolved by consumer's link against libpdx-audit;
+//     this satellite compiles the reference as an unresolved external.
 // Cross-module constants referenced (all in SchemaRecord):
 //   SR_OK, SR_ERR_NULL_NAME, SR_ERR_NAME_RANGE, SR_ERR_NULL_BODY,
-//   SR_ERR_ENOSPC, SR_MAX_SCHEMAS (32), SR_MAX_FQNAME_LEN (64),
-//   SR_SLOT_EMPTY (0), SR_SLOT_OCCUPIED (1)
+//   SR_ERR_ENOSPC, SR_ERR_NO_AUDIT (M3-001), SR_MAX_SCHEMAS (32),
+//   SR_MAX_FQNAME_LEN (64), SR_SLOT_EMPTY (0), SR_SLOT_OCCUPIED (1)
 
 module SchemaRegistry = structure {
 
@@ -79,8 +84,22 @@ module SchemaRegistry = structure {
   pub let schema_register : (u64, u64, u64, u64) -> u64 !{mem} @{} =
     fn (fqname_ptr: u64) (fqname_len: u64) (body_ptr: u64) (body_len: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "libpdx-schema-registry.M2-002: schema_register entry point. Argument gates evaluated inline before the callee-save prologue so the null/range paths return without a push/pop dance: fqname_ptr == 0 → SR_ERR_NULL_NAME (1); fqname_len == 0 OR fqname_len > SR_MAX_FQNAME_LEN (64) → SR_ERR_NAME_RANGE (2); body_ptr == 0 → SR_ERR_NULL_BODY (3). Note body_len == 0 is legal (a zero-body schema hashes to the FNV_OFFSET_BASIS baseline, still a well-defined content hash — no gate on it). After the gates, push rbx/r12/r13/r14/r15 (5 = 40 bytes) so rsp %16 = 0 for the three nested calls to SchemaHash::schema_hash_init / _update / _finalize (all follow SysV). Move args to callee-saves: rbx=fqname_ptr, r12=fqname_len, r13=body_ptr, r14=body_len. Call schema_hash_init (nullary, void). Stage body args for update: mov rdi,r13; mov rsi,r14; call schema_hash_update — its return is discarded because init just ran (schema_hash_active == 1 is guaranteed) so SR_ERR_HASH_INACTIVE cannot fire. Call schema_hash_finalize; capture rax in r15 as content_hash. Dedup scan: xor rcx,rcx; loop while rcx < 32: load schema_slot_state[i] via `lea r11,[rip+schema_slot_state]; mov r10,rcx; shl r10,3; add r10,r11; mov rax,[r10]`; if rax != SR_SLOT_OCCUPIED (1) skip; else load schema_content_hash[i] identically; cmp against r15; on match, load schema_id[i] into rax and jump to epilogue. Free-slot scan: xor rcx,rcx; loop while rcx < 32: load schema_slot_state[i]; if != SR_SLOT_EMPTY (0) advance; else fall through with rcx = free slot i. If loop exhausts, rax = SR_ERR_ENOSPC (4), jump to epilogue. Populate: load schema_id_next into r8, allocate handed-out id as r8, increment schema_id_next in .bss (write r8 + 1), store r8 at schema_id[rcx], store r15 at schema_content_hash[rcx], store rbx at schema_fqname_ptr[rcx], store r12 at schema_fqname_len[rcx], store r13 at schema_body_ptr[rcx], store r14 at schema_body_len[rcx], write SR_SLOT_OCCUPIED (1) at schema_slot_state[rcx]. rax = r8 (return id). Epilogue: pop r15/r14/r13/r12/rbx (reverse push order); ret. Every array store uses the same lea+shl+add idiom the dedup scan's loads use. No test mnemonic. Immediates: 0 (null/state-empty compares), 1 (SR_ERR_NULL_NAME / SR_SLOT_OCCUPIED write), 2 (SR_ERR_NAME_RANGE), 3 (SR_ERR_NULL_BODY / shl bit count), 4 (SR_ERR_ENOSPC), 32 (SR_MAX_SCHEMAS bound), 64 (SR_MAX_FQNAME_LEN bound) — all imm8 and well within 0x7FFFFFFF. Label prefix snr_ per project reserved-label discipline (bare 'ok'/'fail'/'loop' would collide with paideia-as keywords).",
+      justification: "libpdx-schema-registry.M2-002 + M3-001: schema_register entry point. Argument gates evaluated inline before the callee-save prologue so the null/range/audit-closed paths return without a push/pop dance: (M3-001) load AuditRecord::record_state via `lea r11,[rip+record_state]; mov rax,[r11]` (unresolved-external reference at .o time, resolved by the consumer's link against libpdx-audit) and refuse (SR_ERR_NO_AUDIT = 6) unless record_state IN {AUDIT_STATE_BEGUN (1), AUDIT_STATE_OUTPUT (2)} — the client-side D3 / I5 discipline the plan doc pins on any state-mutating op, forcing the caller to have an open audit context before the register can touch the catalog; fqname_ptr == 0 → SR_ERR_NULL_NAME (1); fqname_len == 0 OR fqname_len > SR_MAX_FQNAME_LEN (64) → SR_ERR_NAME_RANGE (2); body_ptr == 0 → SR_ERR_NULL_BODY (3). Note body_len == 0 is legal (a zero-body schema hashes to the FNV_OFFSET_BASIS baseline, still a well-defined content hash — no gate on it). After the gates, push rbx/r12/r13/r14/r15 (5 = 40 bytes) so rsp %16 = 0 for the three nested calls to SchemaHash::schema_hash_init / _update / _finalize (all follow SysV). Move args to callee-saves: rbx=fqname_ptr, r12=fqname_len, r13=body_ptr, r14=body_len. Call schema_hash_init (nullary, void). Stage body args for update: mov rdi,r13; mov rsi,r14; call schema_hash_update — its return is discarded because init just ran (schema_hash_active == 1 is guaranteed) so SR_ERR_HASH_INACTIVE cannot fire. Call schema_hash_finalize; capture rax in r15 as content_hash. Dedup scan: xor rcx,rcx; loop while rcx < 32: load schema_slot_state[i] via `lea r11,[rip+schema_slot_state]; mov r10,rcx; shl r10,3; add r10,r11; mov rax,[r10]`; if rax != SR_SLOT_OCCUPIED (1) skip; else load schema_content_hash[i] identically; cmp against r15; on match, load schema_id[i] into rax and jump to epilogue. Free-slot scan: xor rcx,rcx; loop while rcx < 32: load schema_slot_state[i]; if != SR_SLOT_EMPTY (0) advance; else fall through with rcx = free slot i. If loop exhausts, rax = SR_ERR_ENOSPC (4), jump to epilogue. Populate: load schema_id_next into r8, allocate handed-out id as r8, increment schema_id_next in .bss (write r8 + 1), store r8 at schema_id[rcx], store r15 at schema_content_hash[rcx], store rbx at schema_fqname_ptr[rcx], store r12 at schema_fqname_len[rcx], store r13 at schema_body_ptr[rcx], store r14 at schema_body_len[rcx], write SR_SLOT_OCCUPIED (1) at schema_slot_state[rcx]. rax = r8 (return id). Epilogue: pop r15/r14/r13/r12/rbx (reverse push order); ret. Every array store uses the same lea+shl+add idiom the dedup scan's loads use. No test mnemonic. Immediates: 0 (null/state-empty compares), 1 (SR_ERR_NULL_NAME / SR_SLOT_OCCUPIED write / AUDIT_STATE_BEGUN), 2 (SR_ERR_NAME_RANGE / AUDIT_STATE_OUTPUT), 3 (SR_ERR_NULL_BODY / shl bit count), 4 (SR_ERR_ENOSPC), 6 (SR_ERR_NO_AUDIT), 32 (SR_MAX_SCHEMAS bound), 64 (SR_MAX_FQNAME_LEN bound) — all imm8 and well within 0x7FFFFFFF. Label prefix snr_ per project reserved-label discipline (bare 'ok'/'fail'/'loop' would collide with paideia-as keywords).",
       block: {
+        // ---- Gate 0 (M3-001): audit must be open (D3 / I5). ----------
+        //      record_state is an AuditRecord .bss slot; the reference
+        //      compiles as an unresolved external and is resolved by the
+        //      consumer's link against libpdx-audit.
+        lea r11, [rip + record_state];
+        mov rax, [r11];
+        cmp rax, 1;                              // AUDIT_STATE_BEGUN
+        je snr_audit_ok;
+        cmp rax, 2;                              // AUDIT_STATE_OUTPUT
+        je snr_audit_ok;
+        mov rax, 6;                              // SR_ERR_NO_AUDIT
+        ret;
+
+      snr_audit_ok:
         // ---- Argument gates (pre-prologue, no push/pop required). ----
         cmp rdi, 0;
         je snr_null_name;

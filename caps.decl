@@ -26,6 +26,21 @@
 #     M3-003 wire path to forward register / lookup ops to the kernel
 #     daemon rather than only maintaining a local catalog.
 #
-# At M2 (this milestone): no requires: line — the library issues zero
-# syscalls of its own. declares_output_schemas: is added at M3-001 when
-# the audit hook lands.
+# At M2: no requires: line — the library issues zero syscalls of its
+# own. M3-001 adds the declares_output_schemas: entry below because the
+# register op journals a PdxSchemaRegisterEvent record on every
+# successful catalog mutation (via the caller's already-open audit
+# context — libpdx-schema-registry itself never opens or commits an
+# audit; it only refuses to register when record_state is not in
+# {BEGUN, OUTPUT}).
+
+# Declared output schemas —
+#
+#   * PdxSchemaRegisterEvent@0.1 — the schema-mutation record type the
+#     caller emits (via libpdx-audit's audit_record_output) alongside a
+#     successful schema_register call. Content: fqname bytes + content
+#     hash + assigned id. Wire size TBD when a caller first emits the
+#     record; the declaration here reserves the schema name so an
+#     audit-journal replay can decode records tagged with it.
+declares_output_schemas:
+  - PdxSchemaRegisterEvent@0.1

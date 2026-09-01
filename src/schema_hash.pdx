@@ -1,0 +1,178 @@
+// src/schema_hash.pdx — libpdx-schema-registry.M2-002
+// SchemaHash: streaming content-hash accumulator over a schema body.
+//
+// Three entry points, matching the streaming-digest shape libpdx-audit's
+// AuditHash module lands at its M3-001 (deliberate parity so a consumer
+// linking both libraries sees the same init/update/finalize surface):
+//
+//   schema_hash_init()              -> ()
+//   schema_hash_update(ptr, len)    -> u64  (SR_OK | SR_ERR_HASH_INACTIVE)
+//   schema_hash_finalize()          -> u64  (accumulated hash truncated to u64)
+//
+// The register op (schema_registry.pdx / schema_register) invokes this
+// sequence over the body bytes to derive the content hash used for
+// M2-002's dedup scan. Every register call runs one init/update/finalize
+// cycle on the SchemaRecord singleton — the process only ever has one
+// register in flight at a time, matching libpdx-audit's audit-in-flight
+// singleton pattern.
+//
+// M2-002 primitive: FNV-1a-64 as a placeholder for the BLAKE3-truncated
+// hash the plan doc implicitly assumes (svc.schema-registry's wire
+// hash is 32-byte BLAKE3-truncated per libpdx-semantic-pipe's Registry
+// SR_HASH_LEN). BLAKE3 is not yet a paideia-as stdlib intrinsic; the
+// swap changes only the two loop bodies below and schema_hash_init's
+// seed constant — the API surface and the .bss slots stay identical.
+// This mirrors libpdx-audit's identical placeholder choice.
+//
+// Cross-module symbols read/written (all in SchemaRecord .bss):
+//   schema_hash_state, schema_hash_active
+// Cross-module constants referenced:
+//   SchemaRecord::FNV_OFFSET_BASIS, SchemaRecord::FNV_PRIME
+//   SchemaRecord::SR_OK, SchemaRecord::SR_ERR_HASH_INACTIVE
+
+module SchemaHash = structure {
+
+  // ============================================================================
+  // schema_hash_init() -> ()
+  //
+  // Seeds schema_hash_state with FNV_OFFSET_BASIS (0xcbf29ce484222325)
+  // and sets schema_hash_active = 1. Idempotent: a re-init resets the
+  // state to the empty-stream baseline, matching BLAKE3's Hasher::new
+  // semantics.
+  //
+  // Pure leaf; no callee-save touched.
+  // ============================================================================
+
+  pub let schema_hash_init : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-schema-registry.M2-002: schema_hash_init entry point. Two .bss writes via `lea r11,[rip+sym]; mov [r11],reg`: (1) schema_hash_state = FNV_OFFSET_BASIS (0xcbf29ce484222325, loaded via mov r64,imm64 which paideia-as encodes as MOVABS — outside the 0x7FFFFFFF cmp-imm gate but fine for a register load), (2) schema_hash_active = 1. Mirror of AuditHash::audit_hash_init. Pure leaf, no push/pop, no nested call. Register plan: rax = seed then 1, r11 = LEA scratch. Effects `!{mem} @{}` — pure .bss write, no syscall.",
+      block: {
+        mov rax, 0xcbf29ce484222325;             // FNV_OFFSET_BASIS
+        lea r11, [rip + schema_hash_state];
+        mov [r11], rax;
+
+        mov rax, 1;                              // active = 1
+        lea r11, [rip + schema_hash_active];
+        mov [r11], rax;
+        ret;
+      }
+    }
+
+  // ============================================================================
+  // schema_hash_update(ptr, len) -> u64
+  //   rdi = ptr    (bytes to fold into the hash)
+  //   rsi = len    (byte count; 0 is a legal no-op)
+  //   rax = SR_OK                    on success
+  //       | SR_ERR_HASH_INACTIVE     if schema_hash_init was not called
+  //
+  // Folds `len` bytes at `ptr` into schema_hash_state via the FNV-1a
+  // step: state = (state ^ byte) * FNV_PRIME (0x100000001b3). Bytes
+  // load via the `xor r10,r10; mov_b r10,[rdi + rcx*1]` pattern — the
+  // paideia-as #1248 mitigation shape libpdx-audit's audit_hash_update
+  // documents at length; the explicit *1 scale on the index register
+  // is required because paideia-as's SIB folding only recognizes a
+  // scaled index on the right of `+`.
+  //
+  // Refuses when schema_hash_active == 0. Defence in depth against a
+  // caller who forgot to init — otherwise a fresh accumulation would
+  // begin from the .bss zero state and produce a valid but
+  // semantically-meaningless hash.
+  // ============================================================================
+
+  pub let schema_hash_update : (u64, u64) -> u64 !{mem} @{} =
+    fn (ptr: u64) (len: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-schema-registry.M2-002: schema_hash_update entry point. Mirror of AuditHash::audit_hash_update. Gate 1: schema_hash_active must be 1; on 0 return SR_ERR_HASH_INACTIVE (8). Gate 2: len == 0 is a legal no-op returning SR_OK. Body loads schema_hash_state into r13 (SysV callee-save, pushed with r8 as an alignment pair) and FNV_PRIME (0x100000001b3, MOVABS since > 0x7FFFFFFF but legal for a register load) into r8; iterates rcx = 0..len folding one byte per step via `xor r10,r10; mov_b r10,[rdi + rcx*1]; xor r13,r10; imul r13,r8` — the paideia-as #1248 byte-load discipline (mov_b does not zero-extend; the xor is mandatory) with the explicit *1 scale index (paideia-as SIB folding requires a scaled index on the right of `+`, matching libpdx-audit's identical pattern documented in acpi/checksum.pdx and acpi/hpet.pdx). After the loop stores r13 back to schema_hash_state via lea+mov and returns SR_OK. Push/pop r13 + r8 as a pair to preserve rsp % 16 = 0 for a future refactor that might introduce a nested call — no nested call today so the pair is a nicety but the discipline matches libpdx-audit's audit_hash_update byte-for-byte. No test mnemonic. Immediates: 0 (active-gate / len-zero / SR_OK compare), 1 (active-flag positive value), 8 (SR_ERR_HASH_INACTIVE) — all within 0x7FFFFFFF. Effects `!{mem} @{}` — memory read/write only.",
+      block: {
+        push r13;
+        push r8;
+
+        // ---- Gate 1: hash must be active. -----------------------------
+        lea r11, [rip + schema_hash_active];
+        mov rax, [r11];
+        cmp rax, 0;
+        je  shu_inactive;
+
+        // ---- Gate 2: len == 0 is a legal no-op. -----------------------
+        cmp rsi, 0;
+        je  shu_done_ok;
+
+        // ---- Load state + prime into loop registers. -----------------
+        lea r11, [rip + schema_hash_state];
+        mov r13, [r11];                          // state
+        mov r8,  0x100000001b3;                  // FNV_PRIME
+
+        xor rcx, rcx;                            // byte index = 0
+
+      shu_loop:
+        xor r10, r10;                            // byte scratch = 0
+        mov_b r10, [rdi + rcx * 1];              // r10 = *(u8*)(ptr + rcx)
+
+        xor r13, r10;                            // state ^= byte
+        imul r13, r8;                            // state *= FNV_PRIME
+
+        add rcx, 1;
+        cmp rcx, rsi;
+        jb  shu_loop;
+
+        // ---- Store state back to .bss. --------------------------------
+        lea r11, [rip + schema_hash_state];
+        mov [r11], r13;
+
+      shu_done_ok:
+        xor rax, rax;                            // SR_OK
+        pop r8;
+        pop r13;
+        ret;
+
+      shu_inactive:
+        mov rax, 8;                              // SR_ERR_HASH_INACTIVE
+        pop r8;
+        pop r13;
+        ret;
+      }
+    }
+
+  // ============================================================================
+  // schema_hash_finalize() -> u64
+  //   rax = accumulated hash (u64) if active == 1
+  //       | 0                        if active == 0
+  //
+  // Reads schema_hash_state, clears schema_hash_active to 0, returns
+  // the state. Single-use discipline matches BLAKE3's Hasher::finalize;
+  // a caller wanting a fresh stream calls schema_hash_init again.
+  //
+  // Returns 0 when inactive rather than an error code — the caller's
+  // schema_register accepts a plain u64 content hash and cannot
+  // discriminate a "zero hash by chance" from a "zero hash by finalize-
+  // on-inactive". Consumers who need distinct signalling sequence the
+  // three calls in one scope and rely on schema_hash_update's return.
+  // ============================================================================
+
+  pub let schema_hash_finalize : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-schema-registry.M2-002: schema_hash_finalize entry point. Mirror of AuditHash::audit_hash_finalize. Fast path if inactive: return 0 without touching schema_hash_state (leaves it visible for post-mortem). Active path: load schema_hash_state into rax (return register), clear schema_hash_active to 0 via a rcx-mediated write (rcx holds the zero so rax's return value survives). Pure leaf, no push/pop. Register plan: rax = active-load then state-load (return), rcx = zero scratch for active clear, r11 = LEA scratch. Immediates: 0 (active-gate + inactive return + zero-write) — within 0x7FFFFFFF. Effects `!{mem} @{}` — pure .bss read/write.",
+      block: {
+        // ---- Fast path: inactive returns 0. --------------------------
+        lea r11, [rip + schema_hash_active];
+        mov rax, [r11];
+        cmp rax, 0;
+        je  shf_inactive;
+
+        // ---- Active: load state, clear active flag, return state. ---
+        lea r11, [rip + schema_hash_state];
+        mov rax, [r11];                          // rax = state (return)
+
+        xor rcx, rcx;                            // active = 0 via rcx
+        lea r11, [rip + schema_hash_active];
+        mov [r11], rcx;
+        ret;
+
+      shf_inactive:
+        xor rax, rax;                            // 0
+        ret;
+      }
+    }
+}

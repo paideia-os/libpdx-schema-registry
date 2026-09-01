@@ -1,0 +1,174 @@
+// src/schema_record.pdx — libpdx-schema-registry.M2-001
+// SchemaRecord: singleton .bss storage for the per-process schema catalog.
+//
+// This library is the client-side facade the plan doc §4 describes: an
+// in-memory schema catalog a process maintains locally so tools linking
+// this library can register / lookup / list PdxRecord schemas by
+// fully-qualified name (fqname) without every op round-tripping to the
+// kernel svc.schema-registry daemon. M3-003 layers a wire path over
+// libpdx-semantic-pipe for consumers that want the catalog to be
+// globally visible; M3-001 gates every register on the caller having
+// an open libpdx-audit record (D3 / I5 discipline); M3-002 gates
+// register on a libpdx-elevate-minted authorization flag.
+//
+// See paideia-os → design/round-retrospectives/r90-xrepo-wave3-plan.md
+// §4 for the wave plan; the plan doc puts the KERNEL daemon in the
+// monorepo and reserves this satellite for the client-side facade.
+//
+// Storage shape: eight parallel .bss arrays indexed by slot ordinal
+// i in [0, SR_MAX_SCHEMAS). Parallel arrays (not per-slot struct) mirror
+// libpdx-semantic-pipe's _pipe_fds / _pipe_hashes layout so the scan
+// loops in M2-002 (register) and M2-003 (lookup) can consult one array
+// at a time with a single RIP-relative LEA + shl+add index computation
+// per iteration — paideia-as does not emit scale-index [base+index*8]
+// addressing so an explicit shl+add is the compliant form.
+//
+// paideia-as conformance:
+//   - Module basename PascalCase; no directory prefix.
+//   - No `test` mnemonic — every branch uses cmp reg, imm + je / jne.
+//   - Full-register cmp reg,imm; every immediate ≤ 0x7FFFFFFF.
+//   - r11 = scratch (paideia-as reserved) — used for RIP-relative LEA
+//     staging in reset()'s per-slot loop.
+//   - Leaf function — no callee-save touched, no push/pop.
+
+module SchemaRecord = structure {
+
+  // --- Result codes (0 = OK). Consumers pattern-match on these. --------
+  pub let SR_OK                 : u64 = 0
+  pub let SR_ERR_NULL_NAME      : u64 = 1   // fqname_ptr == 0
+  pub let SR_ERR_NAME_RANGE     : u64 = 2   // fqname_len 0 or > SR_MAX_FQNAME_LEN
+  pub let SR_ERR_NULL_BODY      : u64 = 3   // body_ptr == 0 (register only)
+  pub let SR_ERR_ENOSPC         : u64 = 4   // no free slot in catalog
+  pub let SR_ERR_NOT_FOUND      : u64 = 5   // lookup: no slot matches fqname
+  pub let SR_ERR_NO_AUDIT       : u64 = 6   // M3-001: no libpdx-audit record open
+  pub let SR_ERR_UNAUTHORIZED   : u64 = 7   // M3-002: schema_registry_authorized == 0
+  pub let SR_ERR_HASH_INACTIVE  : u64 = 8   // schema_hash_update without prior init
+
+  // --- Slot state discriminants. .bss zero-init means every slot reads
+  //     EMPTY on first process start, matching the fresh-catalog shape. -
+  pub let SR_SLOT_EMPTY    : u64 = 0
+  pub let SR_SLOT_OCCUPIED : u64 = 1
+
+  // --- Catalog geometry.
+  //
+  //   SR_MAX_SCHEMAS     = 32 — matches libpdx-semantic-pipe's
+  //                             SP_MAX_ENDPOINTS pattern; all cmp reg,imm
+  //                             forms fit imm8, and 32 slots covers the
+  //                             R49/R50 tool catalogue's observed schema
+  //                             count comfortably (PdxFsDirEntry,
+  //                             RawByteChunk, PdxSchemaRegisterEvent,
+  //                             PackageManifest, RemoveRecord, plus
+  //                             headroom).
+  //   SR_MAX_FQNAME_LEN  = 64 — cap on fqname byte-length. Longer than
+  //                             any known schema name at R49/R50; well
+  //                             under libpdx-semantic-pipe's
+  //                             SR_MAX_NAME_LEN (256) for its wire path.
+  //
+  // Both fit imm8, so scan-loop bound checks and length gates encode as
+  // the shortest cmp reg,imm form.
+  pub let SR_MAX_SCHEMAS    : u64 = 32
+  pub let SR_MAX_FQNAME_LEN : u64 = 64
+
+  // --- Content-hash primitive constants. FNV-1a-64 placeholder — same
+  //     primitive choice libpdx-audit made at M3-001 pending BLAKE3 as
+  //     a paideia-as stdlib intrinsic. Both constants are load-only
+  //     (never appear in a cmp instruction) so their > 0x7FFFFFFF widths
+  //     are legal via the paideia-as MOVABS encoding of mov r64, imm64.
+  pub let FNV_OFFSET_BASIS : u64 = 0xcbf29ce484222325
+  pub let FNV_PRIME        : u64 = 0x100000001b3
+
+  // --- Catalog storage — eight parallel arrays indexed by slot i.
+  //
+  //   schema_slot_state [i]  — SR_SLOT_EMPTY (0) or SR_SLOT_OCCUPIED (1)
+  //   schema_id         [i]  — monotonic id assigned at register time
+  //                            (id 0 = reserved "no schema" sentinel;
+  //                            schema_id_next lazily inits to 1)
+  //   schema_content_hash[i] — FNV-1a-64 over body bytes; used for
+  //                            register's dedup scan
+  //   schema_fqname_ptr [i]  — pointer to the fqname bytes in caller
+  //                            memory (caller owns; library never frees)
+  //   schema_fqname_len [i]  — byte length of the fqname
+  //   schema_body_ptr   [i]  — pointer to the schema-body bytes
+  //   schema_body_len   [i]  — byte length of the schema body
+  //   schema_id_next        — next monotonic id to hand out; reset()
+  //                            seeds this to 1 so id 0 stays the sentinel
+  //
+  // Every slot is `uninit` — .bss zero-init makes SR_SLOT_EMPTY (=0)
+  // the default so a process that skipped reset() still reads a coherent
+  // "empty catalog" state. reset() nonetheless writes the sentinels
+  // explicitly so a defensive re-init at post-fork or teardown restores
+  // the fresh shape.
+
+  pub let mut schema_slot_state   : [u64; 32] = uninit @align(8)
+  pub let mut schema_id           : [u64; 32] = uninit @align(8)
+  pub let mut schema_content_hash : [u64; 32] = uninit @align(8)
+  pub let mut schema_fqname_ptr   : [u64; 32] = uninit @align(8)
+  pub let mut schema_fqname_len   : [u64; 32] = uninit @align(8)
+  pub let mut schema_body_ptr     : [u64; 32] = uninit @align(8)
+  pub let mut schema_body_len     : [u64; 32] = uninit @align(8)
+
+  pub let mut schema_id_next      : u64       = uninit @align(8)
+
+  // --- Content-hash accumulator slots. FNV-1a-64 streaming state so
+  //     the register op (M2-002) can fold a body of arbitrary length
+  //     into a single u64 without heap or a stack-resident intermediate
+  //     buffer. Same shape as libpdx-audit's record_hash_state /
+  //     record_hash_active pair.
+  pub let mut schema_hash_state   : u64       = uninit @align(8)
+  pub let mut schema_hash_active  : u64       = uninit @align(8)
+
+  // reset() — bootstrap init. Zeros every slot's state array to
+  // SR_SLOT_EMPTY (already the .bss default; explicit here so a
+  // defensive re-init after fork or a supervisor teardown restores the
+  // fresh shape) and seeds schema_id_next = 1 (so the first handed-out
+  // id is 1, leaving id 0 as the reserved "no schema" sentinel).
+  //
+  // Called ONCE at process start (typical: right after libpdx-argv's
+  // ParsedArgs::reset at _start), not between registers — schema_id_next
+  // must stay monotonic across registers within a process.
+  //
+  // Only the state array is scrubbed in the loop; the other seven
+  // parallel arrays are left with whatever bytes .bss holds because
+  // schema_slot_state[i] == SR_SLOT_EMPTY makes the corresponding
+  // entries in every parallel array unreachable via the M2-002 register
+  // and M2-003 lookup scans (each scan gates on slot_state first). This
+  // mirrors libpdx-semantic-pipe's decision to scrub only _pipe_fds and
+  // leave _pipe_hashes untouched.
+
+  pub let reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-schema-registry.M2-001: reset entry point. Zeros schema_slot_state[0..SR_MAX_SCHEMAS) via the per-slot RIP-relative array-write idiom libpdx-semantic-pipe uses in Binding::reset — lea r11,[rip+base] once, then per iteration: mov r10,rcx; shl r10,3; add r10,r11; mov [r10],rax. paideia-as does not emit scale-index [base+idx*8] addressing so the explicit shl+add is the compliant form. Loop bound compared against SR_MAX_SCHEMAS = 32 (imm8). After the loop, seeds schema_id_next = 1 (mov rax,1; lea r11,[rip+schema_id_next]; mov [r11],rax) so the first schema_register call in a process hands out id 1, leaving id 0 as the reserved 'no schema' sentinel — parallels libpdx-audit's audit_id_next seeding at reset. Also zeros schema_hash_state / schema_hash_active so a fresh reset gives schema_hash_init a clean starting point (rather than inheriting a hash-in-flight from a prior register within the same process). No test mnemonic — every zero-check uses cmp reg, 0. Immediates 0 / 1 / 32 all fit imm8, well within paideia-as cmp-imm bounds. Register plan: rax = fill value (0, then 1 for the id_next seed), rcx = loop counter i in [0, 32), r10 = per-slot pointer scratch (base + i*8), r11 = &schema_slot_state base for the loop and a second RIP-relative LEA target for schema_id_next / schema_hash_state / schema_hash_active. Leaf function — no callee-save touched, no push/pop.",
+      block: {
+        // ---- Zero the schema_slot_state array. ------------------------
+        xor rax, rax;                            // rax = 0 (fill value)
+        xor rcx, rcx;                            // rcx = i = 0
+        lea r11, [rip + schema_slot_state];      // r11 = &schema_slot_state
+
+      sr_reset_loop_head:
+        cmp rcx, 32;                             // SR_MAX_SCHEMAS
+        jae sr_reset_done;
+
+        mov r10, rcx;
+        shl r10, 3;                              // r10 = i * 8
+        add r10, r11;                            // r10 = &schema_slot_state[i]
+        mov [r10], rax;                          // schema_slot_state[i] = 0
+
+        add rcx, 1;
+        jmp sr_reset_loop_head;
+
+      sr_reset_done:
+        // ---- Zero the content-hash accumulator pair. -----------------
+        lea r11, [rip + schema_hash_state];
+        mov [r11], rax;
+        lea r11, [rip + schema_hash_active];
+        mov [r11], rax;
+
+        // ---- Seed schema_id_next = 1 (id 0 reserved as sentinel). ----
+        mov rax, 1;
+        lea r11, [rip + schema_id_next];
+        mov [r11], rax;
+        ret;
+      }
+    }
+}

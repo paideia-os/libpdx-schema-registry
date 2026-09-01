@@ -4,7 +4,7 @@ Schema registry service definition and client library for `paideia-os` semantic 
 
 ## Status
 
-Repo scaffolding only. Owned by round **R90-XREPO.012** (parent issue: `paideia-os/paideia-os#2000`).
+M1 scaffolding + M2-001 (SchemaRecord types + catalog storage) landed. Owned by round **R90-XREPO.012** (parent issue: `paideia-os/paideia-os#2000`); sub-issues tracked in this repo.
 
 ## What this repo will contain
 

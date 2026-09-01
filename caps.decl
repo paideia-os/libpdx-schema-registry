@@ -1,0 +1,31 @@
+# libpdx-schema-registry — caps.decl
+#
+# Wave: R90-XREPO.012 (svc.schema-registry stand-up)
+# Doc:  paideia-os → design/round-retrospectives/r90-xrepo-wave3-plan.md §4
+#
+# libpdx-schema-registry is a client-side shared library. Its M2 API
+# surface (schema_register / schema_lookup / schema_list) is a pure
+# in-process catalog operating on caller-owned memory — no syscalls, no
+# capability grants required from the consumer.
+#
+# M3 layers in three optional cross-library dependencies (see
+# deps.list). The relevant capability surface at that point is inherited
+# from the sibling libraries the consumer links:
+#
+#   * libpdx-audit — needs KIND_IPC_ENDPOINT(write, svc.audit-journal)
+#     via svc_lookup, if the consumer wants the audit hook (M3-001) to
+#     actually publish. libpdx-schema-registry itself only reads
+#     AuditRecord::record_state as a client-side D3 / I5 gate.
+#
+#   * libpdx-elevate — needs KIND_IPC_ENDPOINT(write, svc.elevate-
+#     broker) via svc_lookup, if the consumer wants to acquire the
+#     R_SCHEMA_REGISTER grant that arms the M3-002 gate.
+#
+#   * libpdx-semantic-pipe — needs KIND_IPC_ENDPOINT(write,
+#     svc.schema-registry) via svc_lookup, if the consumer wants the
+#     M3-003 wire path to forward register / lookup ops to the kernel
+#     daemon rather than only maintaining a local catalog.
+#
+# At M2 (this milestone): no requires: line — the library issues zero
+# syscalls of its own. declares_output_schemas: is added at M3-001 when
+# the audit hook lands.

@@ -1,0 +1,266 @@
+// tests/test_register_lookup_smoke.pdx — libpdx-schema-registry.M4-002
+// Register-then-lookup end-to-end smoke driver — the M4-002 witness
+// for the full register / lookup / list flow through schema_register.
+//
+// Unlike the M4-001 drivers (which stay pure-leaf and fault-inject
+// the catalog directly), this driver actually calls schema_register
+// three times to exercise the M2-002 dedup path and the M3-001 audit
+// gate + M3-002 elevate gate integrated with the register body.
+//
+// This requires satisfying schema_register's external reference to
+// AuditRecord::record_state — a symbol otherwise owned by
+// libpdx-audit. This test file provides its own local `record_state`
+// definition (the same technique libpdx-audit's own tests use for
+// their AuditRecord slots) so the paideia-as linker resolves
+// schema_register's reference against the test-owned slot; the test
+// then fault-injects `record_state = AUDIT_STATE_BEGUN (1)` to open
+// the audit gate.
+//
+// Because this test defines a `record_state` symbol, it cannot be
+// linked into a consumer that ALSO links libpdx-audit — the two
+// definitions would collide. Ship this driver as an isolated harness
+// binary (or gate it behind a build flag) when both libraries are
+// present. tests/README.md documents the constraint.
+//
+// Return convention:
+//   0   — all subtests passed.
+//   N>0 — ordinal of the first failing subtest.
+//
+// Effects `!{mem} @{}` — pure .bss read/write; no syscall, no cap.
+//
+// Cross-module symbols read/written (all in SchemaRecord .bss):
+//   schema_slot_state, schema_id, schema_content_hash,
+//   schema_fqname_ptr, schema_body_ptr, schema_body_len
+// Cross-module functions called:
+//   SchemaRecord::reset
+//   SchemaRegistry::schema_registry_arm
+//   SchemaRegistry::schema_register
+//   SchemaRegistry::schema_lookup
+//   SchemaRegistry::schema_list
+
+module TestRegisterLookupSmoke = structure {
+
+  // --- Local record_state stand-in for AuditRecord::record_state. See
+  //     the module header comment for why this exists.
+  pub let mut record_state : u64 = uninit @align(8)
+
+  // --- Fixture schemas (fqnames + bodies). Fqnames are the three the
+  //     M4-002 issue body pins; bodies are unique short byte strings
+  //     so the dedup content-hash is distinct per fqname.
+  pub let _fixture_fqname_a : [u8; 24] = "PdxFsDirEntry\0\0\0\0\0\0\0\0\0\0\0"
+  pub let _fixture_fqname_b : [u8; 24] = "RawByteChunk\0\0\0\0\0\0\0\0\0\0\0\0"
+  pub let _fixture_fqname_c : [u8; 24] = "PdxSchemaRegisterEvent\0\0"
+
+  pub let _fixture_body_a : [u8; 8] = "body_a\0\0"
+  pub let _fixture_body_b : [u8; 8] = "body_b\0\0"
+  pub let _fixture_body_c : [u8; 8] = "body_c\0\0"
+
+  // .bss scratchpad for schema_list output + per-lookup out-params.
+  pub let mut _fixture_list_out : [u64; 8] = uninit @align(8)
+  pub let mut _out_id           : u64      = uninit @align(8)
+  pub let mut _out_hash         : u64      = uninit @align(8)
+  pub let mut _out_body_ptr     : u64      = uninit @align(8)
+  pub let mut _out_body_len     : u64      = uninit @align(8)
+
+  // ============================================================================
+  // run() -> u64
+  //
+  // Subtest ledger:
+  //
+  //   1  reset + arm + record_state = BEGUN succeed (arm returns SR_OK)
+  //   2  schema_register(A) returns id > 0
+  //   3  schema_register(B) returns id > 0 AND != id_A
+  //   4  schema_register(C) returns id > 0 AND != id_A AND != id_B
+  //   5  schema_lookup(A) returns SR_OK
+  //   6  out_id equals id_A
+  //   7  out_body_ptr equals &_fixture_body_a
+  //   8  out_body_len equals 6 (body_a length; fixture is 8B, 6 real chars)
+  //   9  schema_register(A) again (same fqname + same body) dedups to id_A
+  //  10  schema_list write mode returns 3
+  //  11  _fixture_list_out[0..3) == {id_A, id_B, id_C} in that order
+  //
+  // Register plan across the 5-push prologue (rbx/r12/r13/r14/r15 = 40
+  // bytes → rsp %16 = 0 for every nested call):
+  //   r12 = id_A          (preserved across subtests 2..)
+  //   r13 = id_B          (preserved across subtests 3..)
+  //   r14 = id_C          (preserved across subtests 4..)
+  //   r15 = list-write scratch (subtest 11)
+  //   rbx = unused; pushed for alignment parity only
+  //
+  // Body-len constant chosen: the fixture body_a is 8 bytes wide
+  // (u8[8]) but only 6 bytes are meaningful ("body_a") plus 2 NULs.
+  // schema_register receives body_len as an authoritative count; the
+  // test passes 6 so the hash covers only the 6 meaningful bytes and
+  // the dedup on the re-register in subtest 9 works predictably.
+  // ============================================================================
+
+  pub let run : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-schema-registry.M4-002: TestRegisterLookupSmoke::run entry point. 11-subtest end-to-end driver that actually exercises schema_register (not just its data structures). Setup writes local record_state = 1 (AUDIT_STATE_BEGUN) to open the M3-001 audit gate against this test's own record_state stand-in symbol, then calls schema_registry_arm(0x40) to open the M3-002 auth gate. 5-push callee-save prologue (rbx/r12/r13/r14/r15 = 40 bytes) keeps rsp %16 = 0 for every nested call to reset / schema_registry_arm / schema_register / schema_lookup / schema_list — every callee follows SysV so callee-save preservation across them is the SysV default. r12/r13/r14 accumulate the three assigned ids across subtests 2/3/4 so subtests 9 (dedup) and 11 (list order) can compare against them. schema_register signature (fqname_ptr, fqname_len, body_ptr, body_len) fits SysV rdi/rsi/rdx/rcx exactly; schema_lookup (6 args) fits rdi..r9 exactly; schema_list (2 args) fits rdi/rsi. Every subtest failure jumps to a labelled fail block that pops the 5 callee-saves in reverse and returns the ordinal. No test mnemonic. Immediates: 0/1 (SR_OK / AUDIT_STATE_BEGUN), 3 (list count), 6 (body_len), 13 (fqname_a length), 12 (fqname_b length), 22 (fqname_c length), 0x40 (R_SCHEMA_REGISTER), 1..11 (subtest ordinals) — all imm8 or imm32 within 0x7FFFFFFF. Label prefix trls_ per project reserved-label discipline (trd_/tgs_/trls_ are unique to their respective test files).",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        // ==============================================================
+        // Setup: reset catalog, arm auth flag, open audit gate.
+        // ==============================================================
+        call reset;
+
+        mov rdi, 0x40;                           // R_SCHEMA_REGISTER
+        call schema_registry_arm;
+        cmp rax, 0;                              // SR_OK
+        jne trls_fail_1;
+
+        //   record_state = AUDIT_STATE_BEGUN (1)
+        mov rax, 1;
+        lea r11, [rip + record_state];
+        mov [r11], rax;
+
+        // ==============================================================
+        // Subtest 2: register schema A ("PdxFsDirEntry", "body_a").
+        // ==============================================================
+        lea rdi, [rip + _fixture_fqname_a];
+        mov rsi, 13;
+        lea rdx, [rip + _fixture_body_a];
+        mov rcx, 6;
+        call schema_register;
+        cmp rax, 0;
+        je trls_fail_2;
+        mov r12, rax;                            // r12 = id_A
+
+        // ==============================================================
+        // Subtest 3: register schema B; distinct id from A.
+        // ==============================================================
+        lea rdi, [rip + _fixture_fqname_b];
+        mov rsi, 12;
+        lea rdx, [rip + _fixture_body_b];
+        mov rcx, 6;
+        call schema_register;
+        cmp rax, 0;
+        je trls_fail_3;
+        cmp rax, r12;
+        je trls_fail_3;
+        mov r13, rax;                            // r13 = id_B
+
+        // ==============================================================
+        // Subtest 4: register schema C; distinct id from A and B.
+        // ==============================================================
+        lea rdi, [rip + _fixture_fqname_c];
+        mov rsi, 22;
+        lea rdx, [rip + _fixture_body_c];
+        mov rcx, 6;
+        call schema_register;
+        cmp rax, 0;
+        je trls_fail_4;
+        cmp rax, r12;
+        je trls_fail_4;
+        cmp rax, r13;
+        je trls_fail_4;
+        mov r14, rax;                            // r14 = id_C
+
+        // ==============================================================
+        // Subtests 5-8: lookup A.
+        // ==============================================================
+        lea rdi, [rip + _fixture_fqname_a];
+        mov rsi, 13;
+        lea rdx, [rip + _out_id];
+        lea rcx, [rip + _out_hash];
+        lea r8,  [rip + _out_body_ptr];
+        lea r9,  [rip + _out_body_len];
+        call schema_lookup;
+        cmp rax, 0;                              // SR_OK
+        jne trls_fail_5;
+
+        //   out_id == id_A
+        lea r11, [rip + _out_id];
+        mov rax, [r11];
+        cmp rax, r12;
+        jne trls_fail_6;
+
+        //   out_body_ptr == &_fixture_body_a
+        lea r11, [rip + _out_body_ptr];
+        mov rax, [r11];
+        lea r15, [rip + _fixture_body_a];
+        cmp rax, r15;
+        jne trls_fail_7;
+
+        //   out_body_len == 6
+        lea r11, [rip + _out_body_len];
+        mov rax, [r11];
+        cmp rax, 6;
+        jne trls_fail_8;
+
+        // ==============================================================
+        // Subtest 9: re-register A (same body) — dedup to id_A.
+        // ==============================================================
+        lea rdi, [rip + _fixture_fqname_a];
+        mov rsi, 13;
+        lea rdx, [rip + _fixture_body_a];
+        mov rcx, 6;
+        call schema_register;
+        cmp rax, r12;
+        jne trls_fail_9;
+
+        // ==============================================================
+        // Subtest 10: list (write mode) returns 3.
+        // ==============================================================
+        lea rdi, [rip + _fixture_list_out];
+        mov rsi, 8;
+        call schema_list;
+        cmp rax, 3;
+        jne trls_fail_10;
+
+        // ==============================================================
+        // Subtest 11: list order matches {id_A, id_B, id_C}.
+        // ==============================================================
+        lea r11, [rip + _fixture_list_out];
+        mov rax, [r11];
+        cmp rax, r12;
+        jne trls_fail_11;
+
+        lea r11, [rip + _fixture_list_out];
+        add r11, 8;
+        mov rax, [r11];
+        cmp rax, r13;
+        jne trls_fail_11;
+
+        lea r11, [rip + _fixture_list_out];
+        add r11, 16;
+        mov rax, [r11];
+        cmp rax, r14;
+        jne trls_fail_11;
+
+        // All pass.
+        xor rax, rax;
+        pop r15; pop r14; pop r13; pop r12; pop rbx;
+        ret;
+
+      trls_fail_1:
+        mov rax, 1;  pop r15; pop r14; pop r13; pop r12; pop rbx; ret;
+      trls_fail_2:
+        mov rax, 2;  pop r15; pop r14; pop r13; pop r12; pop rbx; ret;
+      trls_fail_3:
+        mov rax, 3;  pop r15; pop r14; pop r13; pop r12; pop rbx; ret;
+      trls_fail_4:
+        mov rax, 4;  pop r15; pop r14; pop r13; pop r12; pop rbx; ret;
+      trls_fail_5:
+        mov rax, 5;  pop r15; pop r14; pop r13; pop r12; pop rbx; ret;
+      trls_fail_6:
+        mov rax, 6;  pop r15; pop r14; pop r13; pop r12; pop rbx; ret;
+      trls_fail_7:
+        mov rax, 7;  pop r15; pop r14; pop r13; pop r12; pop rbx; ret;
+      trls_fail_8:
+        mov rax, 8;  pop r15; pop r14; pop r13; pop r12; pop rbx; ret;
+      trls_fail_9:
+        mov rax, 9;  pop r15; pop r14; pop r13; pop r12; pop rbx; ret;
+      trls_fail_10:
+        mov rax, 10; pop r15; pop r14; pop r13; pop r12; pop rbx; ret;
+      trls_fail_11:
+        mov rax, 11; pop r15; pop r14; pop r13; pop r12; pop rbx; ret;
+      }
+    }
+}

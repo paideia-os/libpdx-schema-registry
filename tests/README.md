@@ -28,8 +28,18 @@ Both land at M4; M5 (signed release) is deferred to a future round.
   policy, and the reset-clears-flag invariant. Returns 0 on pass or
   a 1..12 subtest ordinal on failure.
 
-- `test_register_lookup_smoke.pdx` — M4-002 driver. Register-then-
-  lookup smoke witness; see M4-002 (issue #10) for its ledger.
+- `test_register_lookup_smoke.pdx` — M4-002 driver. Exports
+  `TestRegisterLookupSmoke::run() -> u64`. End-to-end witness that
+  actually calls `schema_register` three times with distinct
+  fixture schemas (`PdxFsDirEntry`, `RawByteChunk`,
+  `PdxSchemaRegisterEvent`), then looks each up and asserts id +
+  body_ptr + body_len round-trip byte-for-byte, then re-registers
+  the first schema to prove the M2-002 content-hash dedup returns
+  the original id, then lists to verify count == 3 and per-slot
+  ordering. To satisfy `schema_register`'s external reference to
+  `AuditRecord::record_state`, this driver declares its own
+  `record_state` symbol locally (see *Coexistence with libpdx-audit*
+  below). Returns 0 on pass or a 1..11 subtest ordinal on failure.
 
 ## Return-code convention
 
@@ -97,6 +107,20 @@ Once those three are in place, the smoke matrix runs:
    audit + elevate context and observes the daemon's `KIND_IPC_ENDPOINT`
    reply matches the expected wire layout defined in
    `src/schema_wire.pdx`.
+
+## Coexistence with libpdx-audit
+
+`test_register_lookup_smoke.pdx` (M4-002) declares a local
+`record_state` symbol to satisfy `schema_register`'s external
+reference so a standalone-linked test binary can exercise the
+register path end-to-end. This local definition **collides with
+libpdx-audit's own `record_state`** at link time when both are
+present. Consumers running the full driver set alongside a real
+libpdx-audit therefore package this specific driver as an isolated
+harness binary (or gate its inclusion behind a build flag). The
+M4-001 drivers (`test_register_dedup.pdx`,
+`test_gate_semantics.pdx`) touch only library-owned state and
+coexist with libpdx-audit unconditionally.
 
 ## Interim runtime discipline
 

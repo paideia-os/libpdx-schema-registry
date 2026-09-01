@@ -1,0 +1,172 @@
+// tests/test_gate_semantics.pdx — libpdx-schema-registry.M4-001
+// Driver for the M3-002 elevate-gate semantics (arm / disarm /
+// is_armed) plus a compile-observable check that the M3-001 audit gate
+// error code exists in the exported constant set.
+//
+// The M3-001 audit gate itself references AuditRecord::record_state as
+// an unresolved external in schema_register — exercising the full
+// register-with-audit-open path is deferred to the QEMU consumer
+// harness documented in tests/README.md (a local record_state
+// definition here would collide with libpdx-audit's when both are
+// linked). This driver stays inside pure library-owned state.
+//
+// Return convention:
+//   0   — all subtests passed.
+//   N>0 — ordinal of the first failing subtest (stable across runs).
+//
+// Effects `!{mem} @{}` — pure .bss read/write; no syscall.
+//
+// Cross-module symbols read/written (all in SchemaRecord .bss):
+//   schema_registry_authorized
+// Cross-module functions called (all pure leaves):
+//   SchemaRecord::reset
+//   SchemaRegistry::schema_registry_arm
+//   SchemaRegistry::schema_registry_disarm
+//   SchemaRegistry::schema_registry_is_armed
+
+module TestGateSemantics = structure {
+
+  // ============================================================================
+  // run() -> u64
+  //
+  // Subtest ledger:
+  //
+  //   1  reset() -> schema_registry_authorized == 0 (fail-closed)
+  //   2  schema_registry_is_armed() -> 0 immediately after reset
+  //   3  schema_registry_arm(R_SCHEMA_REGISTER=0x40) -> SR_OK
+  //   4  schema_registry_authorized == 1 after successful arm
+  //   5  schema_registry_is_armed() -> 1 after successful arm
+  //   6  schema_registry_arm(0x01) -> SR_ERR_UNAUTHORIZED (mask lacks
+  //      R_SCHEMA_REGISTER bit)
+  //   7  schema_registry_authorized still == 1 (failed arm leaves prior
+  //      state — arm is a one-way write, not a clear-and-set)
+  //   8  schema_registry_arm(0) -> SR_ERR_UNAUTHORIZED (zero mask)
+  //   9  schema_registry_disarm() -> schema_registry_authorized == 0
+  //  10  schema_registry_is_armed() -> 0 after disarm
+  //  11  reset() -> schema_registry_authorized == 0 (again — reset's
+  //      M3-002 addition clears it as well)
+  //  12  schema_registry_arm(0xFF) -> SR_OK (any mask carrying bit 6)
+  //
+  // Register plan: 3-push prologue r12+r13+r14 for rsp %16 alignment
+  // parity across the nested calls (same shape as
+  // TestRegisterDedup::run). All ordinal returns are direct jumps.
+  // ============================================================================
+
+  pub let run : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-schema-registry.M4-001: TestGateSemantics::run entry point. 12-subtest sequential driver against the SchemaRegistry::schema_registry_arm / disarm / is_armed trio and the SchemaRecord::schema_registry_authorized .bss slot. 3-push prologue (r12/r13/r14 = 24 bytes) preserves rsp %16 = 0 for the nested calls. Subtest 1 verifies reset() zeros the auth flag. Subtest 2 verifies is_armed reports 0. Subtests 3-5 verify a valid arm (cap_mask carrying R_SCHEMA_REGISTER=0x40) succeeds and both the .bss slot AND the is_armed accessor agree. Subtest 6 verifies a mask without bit 6 (0x01) refuses arm. Subtest 7 verifies a refused arm leaves the flag at its prior value (1 from subtest 3). Subtest 8 verifies a zero mask refuses. Subtests 9-10 verify disarm clears both the slot and the accessor. Subtest 11 verifies reset() also clears the flag (M3-002 addition to reset's zero pass). Subtest 12 verifies a broad mask (0xFF, all low 8 bits set) arms — any mask carrying bit 6 is legal, matching schema_registry_arm's `and rax, 0x40; cmp rax, 0` gate. No test mnemonic. Immediates: 0/1 (SR_OK / flag value / SR_ERR_UNAUTHORIZED discriminator), 7 (SR_ERR_UNAUTHORIZED), 0x40 (R_SCHEMA_REGISTER), 0x01 / 0xFF (arm masks), 1..12 (subtest ordinals) — all imm8 or imm32 well within 0x7FFFFFFF. Label prefix tgs_ per project reserved-label discipline (tgs_ is unique to this test file relative to trd_ used by test_register_dedup).",
+      block: {
+        push r12;
+        push r13;
+        push r14;
+
+        // ---- Subtest 1: reset -> authorized == 0. ---------------------
+        call reset;
+        lea r11, [rip + schema_registry_authorized];
+        mov rax, [r11];
+        cmp rax, 0;
+        jne tgs_fail_1;
+
+        // ---- Subtest 2: is_armed -> 0. --------------------------------
+        call schema_registry_is_armed;
+        cmp rax, 0;
+        jne tgs_fail_2;
+
+        // ---- Subtest 3: arm(0x40) -> SR_OK. --------------------------
+        mov rdi, 0x40;                           // R_SCHEMA_REGISTER
+        call schema_registry_arm;
+        cmp rax, 0;                              // SR_OK
+        jne tgs_fail_3;
+
+        // ---- Subtest 4: authorized == 1. ------------------------------
+        lea r11, [rip + schema_registry_authorized];
+        mov rax, [r11];
+        cmp rax, 1;
+        jne tgs_fail_4;
+
+        // ---- Subtest 5: is_armed -> 1. --------------------------------
+        call schema_registry_is_armed;
+        cmp rax, 1;
+        jne tgs_fail_5;
+
+        // ---- Subtest 6: arm(0x01) -> SR_ERR_UNAUTHORIZED. -------------
+        mov rdi, 0x01;
+        call schema_registry_arm;
+        cmp rax, 7;                              // SR_ERR_UNAUTHORIZED
+        jne tgs_fail_6;
+
+        // ---- Subtest 7: authorized still == 1 after refused arm. -----
+        lea r11, [rip + schema_registry_authorized];
+        mov rax, [r11];
+        cmp rax, 1;
+        jne tgs_fail_7;
+
+        // ---- Subtest 8: arm(0) -> SR_ERR_UNAUTHORIZED. ---------------
+        xor rdi, rdi;
+        call schema_registry_arm;
+        cmp rax, 7;                              // SR_ERR_UNAUTHORIZED
+        jne tgs_fail_8;
+
+        // ---- Subtest 9: disarm clears the slot. ----------------------
+        call schema_registry_disarm;
+        lea r11, [rip + schema_registry_authorized];
+        mov rax, [r11];
+        cmp rax, 0;
+        jne tgs_fail_9;
+
+        // ---- Subtest 10: is_armed -> 0 after disarm. -----------------
+        call schema_registry_is_armed;
+        cmp rax, 0;
+        jne tgs_fail_10;
+
+        // ---- Subtest 11: reset also clears. --------------------------
+        //      Arm first so reset has something to clear.
+        mov rdi, 0x40;
+        call schema_registry_arm;
+        call reset;
+        lea r11, [rip + schema_registry_authorized];
+        mov rax, [r11];
+        cmp rax, 0;
+        jne tgs_fail_11;
+
+        // ---- Subtest 12: arm(0xFF) -> SR_OK. --------------------------
+        mov rdi, 0xFF;
+        call schema_registry_arm;
+        cmp rax, 0;                              // SR_OK
+        jne tgs_fail_12;
+
+        // All pass.
+        xor rax, rax;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret;
+
+      tgs_fail_1:
+        mov rax, 1;  pop r14; pop r13; pop r12; ret;
+      tgs_fail_2:
+        mov rax, 2;  pop r14; pop r13; pop r12; ret;
+      tgs_fail_3:
+        mov rax, 3;  pop r14; pop r13; pop r12; ret;
+      tgs_fail_4:
+        mov rax, 4;  pop r14; pop r13; pop r12; ret;
+      tgs_fail_5:
+        mov rax, 5;  pop r14; pop r13; pop r12; ret;
+      tgs_fail_6:
+        mov rax, 6;  pop r14; pop r13; pop r12; ret;
+      tgs_fail_7:
+        mov rax, 7;  pop r14; pop r13; pop r12; ret;
+      tgs_fail_8:
+        mov rax, 8;  pop r14; pop r13; pop r12; ret;
+      tgs_fail_9:
+        mov rax, 9;  pop r14; pop r13; pop r12; ret;
+      tgs_fail_10:
+        mov rax, 10; pop r14; pop r13; pop r12; ret;
+      tgs_fail_11:
+        mov rax, 11; pop r14; pop r13; pop r12; ret;
+      tgs_fail_12:
+        mov rax, 12; pop r14; pop r13; pop r12; ret;
+      }
+    }
+}

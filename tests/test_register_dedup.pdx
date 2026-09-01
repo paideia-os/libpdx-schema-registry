@@ -1,0 +1,248 @@
+// tests/test_register_dedup.pdx — libpdx-schema-registry.M4-001
+// Driver for the M2-002 content-hash dedup + monotonic id semantics
+// plus the M2-003 lookup and M2-004 list contracts. Uses .bss fault-
+// injection on the catalog slots rather than calling schema_register
+// directly — same discipline libpdx-audit's tests/test_replay_golden.pdx
+// documents: the library is a leaf shared library with no runnable
+// executable of its own, so drivers stay in the pure-leaf subset of
+// the API and simulate register outcomes by writing the catalog state
+// they would produce.
+//
+// The full end-to-end path (schema_register with a real audit context
+// and a real elevate grant) is deferred to a future QEMU consumer
+// harness — schema_register references AuditRecord::record_state as an
+// unresolved external, so exercising it from an isolated test module
+// would require providing a local record_state definition and colliding
+// with libpdx-audit's when both are linked. tests/README.md documents
+// the deferred protocol.
+//
+// Return convention:
+//   0   — all subtests passed.
+//   N>0 — ordinal of the first failing subtest (stable across runs).
+//
+// Effects `!{mem} @{}` — pure .bss read/write; no syscall, no cap.
+//
+// Cross-module symbols read/written (all in SchemaRecord .bss):
+//   schema_slot_state[i], schema_id[i], schema_content_hash[i],
+//   schema_fqname_ptr[i], schema_fqname_len[i]
+// Cross-module functions called (all pure leaves):
+//   SchemaRecord::reset
+//   SchemaRegistry::schema_lookup
+//   SchemaRegistry::schema_list
+
+module TestRegisterDedup = structure {
+
+  // --- Fixture data. The test needs stable byte-array pointers to hand
+  //     to schema_lookup as fqname query arguments; declaring them
+  //     .rodata means the addresses stay valid for the driver's
+  //     lifetime and the byte compare in schema_lookup finds a match
+  //     when the fault-injected fqname_ptr points at the same address.
+  //
+  //     Widths chosen to match the byte-count constants inline; both
+  //     names are shorter than SR_MAX_FQNAME_LEN (64).
+  pub let _fixture_fqname_a : [u8; 16] = "PdxFsDirEntry\0\0\0"
+  pub let _fixture_fqname_b : [u8; 16] = "RawByteChunk\0\0\0\0"
+
+  // .bss scratchpad for schema_list output. 8 u64 slots is well over
+  // the two occupied slots the driver ever fault-injects.
+  pub let mut _fixture_list_out : [u64; 8] = uninit @align(8)
+
+  // ============================================================================
+  // run() -> u64
+  //
+  // Subtest ledger:
+  //
+  //   1  reset() -> schema_slot_state[0] == SR_SLOT_EMPTY
+  //   2  reset() -> schema_id_next == 1 (first-id-hands-out-1 discipline)
+  //   3  fault-inject slot 0 occupied (fqname="PdxFsDirEntry", id=1);
+  //      schema_lookup with matching fqname -> SR_OK
+  //   4  ... the SR_OK path returned the expected id (1)
+  //   5  fault-inject slot 1 occupied (fqname="RawByteChunk", id=2);
+  //      schema_list(out, 8) -> count == 2
+  //   6  schema_list wrote id 1 at out[0]
+  //   7  schema_list wrote id 2 at out[1]
+  //   8  schema_list probe mode (max_count=0) -> 2
+  //   9  schema_lookup for a non-existent fqname -> SR_ERR_NOT_FOUND
+  //  10  reset() -> schema_slot_state[0] == SR_SLOT_EMPTY (cleared)
+  //
+  // Register plan (nested calls to reset / schema_lookup / schema_list;
+  // 3-push prologue r12+r13+r14 = 24 bytes → rsp %16 = 8 + 24 = 32 →
+  // mod 16 = 0 for every nested call):
+  //   r12 = ordinal accumulator (not used; each subtest branches to a
+  //         labelled fail block returning its ordinal directly)
+  //   r13 = scratch across schema_lookup out-param capture
+  //   r14 = scratch (alignment pair with r13)
+  //
+  //   Actually the driver does not need to preserve an accumulator
+  //   between subtests — each subtest either passes and falls through
+  //   or fails and returns immediately. The 3-push prologue is
+  //   alignment-only.
+  // ============================================================================
+
+  pub let run : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-schema-registry.M4-001: TestRegisterDedup::run entry point. Sequential 10-subtest driver against SchemaRecord's .bss catalog. 3-push prologue (r12 + r13 + r14 = 24 bytes) → rsp %16 = 8 + 24 = 32 → 0 mod 16 for the nested calls to SchemaRecord::reset / SchemaRegistry::schema_lookup / SchemaRegistry::schema_list. Subtest 1: call reset; load schema_slot_state[0] via `lea r11,[rip+schema_slot_state]; mov rax,[r11]` (slot 0 is at offset 0); cmp against 0 (SR_SLOT_EMPTY); on nonzero return ordinal 1. Subtest 2: load schema_id_next; cmp against 1; on mismatch return 2. Subtests 3-4: fault-inject slot 0 to OCCUPIED with fqname pointer at _fixture_fqname_a and length 13, id 1; call schema_lookup(_fixture_fqname_a, 13, &out_id, 0, 0, 0) — return path stashes id via out param; assert rc == SR_OK (subtest 3) and out_id == 1 (subtest 4). Subtests 5-7: fault-inject slot 1 to OCCUPIED with fqname _fixture_fqname_b, id 2; call schema_list(&_fixture_list_out, 8); assert count == 2 (subtest 5), _fixture_list_out[0] == 1 (subtest 6), _fixture_list_out[1] == 2 (subtest 7). Subtest 8: schema_list(0, 0) probe mode; assert count == 2. Subtest 9: schema_lookup for a fqname NOT in the catalog (reuse _fixture_fqname_a byte pointer but pass a length of 10 that no OCCUPIED slot matches — a subtle mismatch that exercises the length-gate skip path); assert SR_ERR_NOT_FOUND (5). Subtest 10: reset again; verify schema_slot_state[0] cleared to 0. Every fault-injection uses the parallel-array shl-by-3 offset idiom the library itself uses for its per-slot writes. Every subtest failure jumps to its own labelled fail block returning the ordinal. Pass path: pop r14/r13/r12; xor rax,rax; ret. Every fail block: pop r14/r13/r12; mov rax,<ord>; ret. No test mnemonic. Immediates: 0/1/2/5/8/10/13 (SR_OK, ids, ordinals, byte-lengths — all imm8), 32 (bound not needed here since we index directly), 3 (shl bit count). Label prefix trd_ per project reserved-label discipline.",
+      block: {
+        push r12;
+        push r13;
+        push r14;
+
+        // ---- Subtest 1: reset -> slot 0 empty. ------------------------
+        call reset;
+        lea r11, [rip + schema_slot_state];
+        mov rax, [r11];                          // slot_state[0]
+        cmp rax, 0;
+        jne trd_fail_1;
+
+        // ---- Subtest 2: reset -> schema_id_next == 1. -----------------
+        lea r11, [rip + schema_id_next];
+        mov rax, [r11];
+        cmp rax, 1;
+        jne trd_fail_2;
+
+        // ---- Subtests 3-4: fault-inject slot 0 + lookup. --------------
+        //      schema_slot_state[0] = SR_SLOT_OCCUPIED (1)
+        mov rax, 1;
+        lea r11, [rip + schema_slot_state];
+        mov [r11], rax;
+
+        //      schema_fqname_ptr[0] = &_fixture_fqname_a
+        lea rax, [rip + _fixture_fqname_a];
+        lea r11, [rip + schema_fqname_ptr];
+        mov [r11], rax;
+
+        //      schema_fqname_len[0] = 13 ("PdxFsDirEntry" length)
+        mov rax, 13;
+        lea r11, [rip + schema_fqname_len];
+        mov [r11], rax;
+
+        //      schema_id[0] = 1
+        mov rax, 1;
+        lea r11, [rip + schema_id];
+        mov [r11], rax;
+
+        //      Call schema_lookup(_fixture_fqname_a, 13, &_fixture_list_out[7], 0, 0, 0)
+        //      (reusing _fixture_list_out[7] as scratch for out_id since
+        //      subtests 5-7 only touch [0] and [1])
+        lea rdi, [rip + _fixture_fqname_a];
+        mov rsi, 13;
+        lea rdx, [rip + _fixture_list_out];
+        add rdx, 56;                             // &_fixture_list_out[7]
+        xor rcx, rcx;
+        xor r8, r8;
+        xor r9, r9;
+        call schema_lookup;
+
+        cmp rax, 0;                              // SR_OK
+        jne trd_fail_3;
+
+        //      Verify out_id was written with 1.
+        lea r11, [rip + _fixture_list_out];
+        add r11, 56;                             // &_fixture_list_out[7]
+        mov rax, [r11];
+        cmp rax, 1;
+        jne trd_fail_4;
+
+        // ---- Subtests 5-7: fault-inject slot 1 + list. ----------------
+        //      schema_slot_state[1] = SR_SLOT_OCCUPIED (1) via offset 8
+        mov rax, 1;
+        lea r11, [rip + schema_slot_state];
+        add r11, 8;
+        mov [r11], rax;
+
+        //      schema_fqname_ptr[1] = &_fixture_fqname_b
+        lea rax, [rip + _fixture_fqname_b];
+        lea r11, [rip + schema_fqname_ptr];
+        add r11, 8;
+        mov [r11], rax;
+
+        //      schema_fqname_len[1] = 12
+        mov rax, 12;
+        lea r11, [rip + schema_fqname_len];
+        add r11, 8;
+        mov [r11], rax;
+
+        //      schema_id[1] = 2
+        mov rax, 2;
+        lea r11, [rip + schema_id];
+        add r11, 8;
+        mov [r11], rax;
+
+        //      Call schema_list(&_fixture_list_out, 8)
+        lea rdi, [rip + _fixture_list_out];
+        mov rsi, 8;
+        call schema_list;
+
+        cmp rax, 2;
+        jne trd_fail_5;
+
+        //      _fixture_list_out[0] == 1
+        lea r11, [rip + _fixture_list_out];
+        mov rax, [r11];
+        cmp rax, 1;
+        jne trd_fail_6;
+
+        //      _fixture_list_out[1] == 2
+        lea r11, [rip + _fixture_list_out];
+        add r11, 8;
+        mov rax, [r11];
+        cmp rax, 2;
+        jne trd_fail_7;
+
+        // ---- Subtest 8: schema_list probe mode returns 2. -------------
+        xor rdi, rdi;                            // out_ids_ptr = 0
+        xor rsi, rsi;                            // max_count = 0
+        call schema_list;
+        cmp rax, 2;
+        jne trd_fail_8;
+
+        // ---- Subtest 9: schema_lookup for a mismatching length. -------
+        //      (length 10 matches no OCCUPIED slot's fqname_len of 13/12)
+        lea rdi, [rip + _fixture_fqname_a];
+        mov rsi, 10;
+        xor rdx, rdx;
+        xor rcx, rcx;
+        xor r8, r8;
+        xor r9, r9;
+        call schema_lookup;
+        cmp rax, 5;                              // SR_ERR_NOT_FOUND
+        jne trd_fail_9;
+
+        // ---- Subtest 10: reset again, slot 0 cleared. -----------------
+        call reset;
+        lea r11, [rip + schema_slot_state];
+        mov rax, [r11];
+        cmp rax, 0;
+        jne trd_fail_10;
+
+        // All subtests passed.
+        xor rax, rax;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret;
+
+      trd_fail_1:
+        mov rax, 1;  pop r14; pop r13; pop r12; ret;
+      trd_fail_2:
+        mov rax, 2;  pop r14; pop r13; pop r12; ret;
+      trd_fail_3:
+        mov rax, 3;  pop r14; pop r13; pop r12; ret;
+      trd_fail_4:
+        mov rax, 4;  pop r14; pop r13; pop r12; ret;
+      trd_fail_5:
+        mov rax, 5;  pop r14; pop r13; pop r12; ret;
+      trd_fail_6:
+        mov rax, 6;  pop r14; pop r13; pop r12; ret;
+      trd_fail_7:
+        mov rax, 7;  pop r14; pop r13; pop r12; ret;
+      trd_fail_8:
+        mov rax, 8;  pop r14; pop r13; pop r12; ret;
+      trd_fail_9:
+        mov rax, 9;  pop r14; pop r13; pop r12; ret;
+      trd_fail_10:
+        mov rax, 10; pop r14; pop r13; pop r12; ret;
+      }
+    }
+}

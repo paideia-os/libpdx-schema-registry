@@ -24,3 +24,4 @@
 
 libpdx-audit >= 1.0.0, < 2.0.0
 libpdx-elevate >= 1.0.0, < 2.0.0
+libpdx-semantic-pipe >= 1.0.0, < 2.0.0

@@ -1,0 +1,258 @@
+// src/schema_wire.pdx — libpdx-schema-registry.M3-003
+// SchemaWire: wire-protocol definitions and marshalling helpers for
+// the client-to-daemon svc.schema-registry endpoint.
+//
+// Landing this module gives satellite tools a stable byte-for-byte
+// wire target to link against even before the kernel-side daemon body
+// exists (per the R90-XREPO wave-3 plan §4, the daemon lives in the
+// monorepo at src/kernel/services/schema_registry.pdx and today
+// dispatches a stub). Consumers that want to publish or resolve
+// schemas across processes marshal payloads with the helpers here and
+// hand the bytes to libpdx-semantic-pipe's Send::send_frame /
+// Recv::recv_frame — this module deliberately does NOT invoke those
+// transports itself so it stays link-friendly for callers that only
+// want the wire spec (a tool with a local-only catalog links this file
+// for the constants without pulling in the full semantic-pipe transport
+// dependency).
+//
+// The RESOLVE half (name → 32-byte hash) is already implemented by
+// libpdx-semantic-pipe.Registry.registry_resolve — this module mirrors
+// the RESOLVE op codes byte-for-byte and adds the REGISTER half
+// (name + hash → assigned id).
+//
+// Wire ops:
+//
+//   SR_WIRE_OP_RESOLVE_REQ  = 0x01   (mirror of semantic-pipe
+//                                     Registry SP_OP_SCHEMA_RESOLVE_REQ)
+//   SR_WIRE_OP_RESOLVE_REP  = 0x81   (mirror; high bit = reply)
+//   SR_WIRE_OP_REGISTER_REQ = 0x02   (new; declared here)
+//   SR_WIRE_OP_REGISTER_REP = 0x82   (new; high bit = reply)
+//
+// Wire capacities (byte-for-byte matches libpdx-semantic-pipe.Registry):
+//
+//   SR_WIRE_HASH_LEN     = 32   — 32-byte BLAKE3-truncated schema hash
+//                                 (this satellite still uses u64
+//                                 FNV-1a-64 for its in-process catalog;
+//                                 the wire hash is a 32-byte future-
+//                                 facing width the pack helper writes
+//                                 as 8 bytes of hash followed by 24
+//                                 bytes of zero padding — a decoder
+//                                 tolerant of the eventual primitive
+//                                 swap parses the whole 32-byte lane)
+//   SR_WIRE_MAX_NAME_LEN = 256  — cap on schema-name byte-length
+//   SR_WIRE_VER          = 1    — frame header version bits
+//
+// REGISTER_REQ payload layout (assembled by schema_wire_pack_register_req):
+//
+//   offset 0    : u64 fqname_len
+//   offset 8    : fqname bytes (up to SR_WIRE_MAX_NAME_LEN)
+//   offset 8+N  : u64 content_hash (FNV-1a-64 today; first 8 bytes of
+//                 the 32-byte lane the future BLAKE3 primitive would
+//                 occupy — remaining 24 bytes are zero)
+//   offset 16+N : 24 bytes of zero padding (BLAKE3 tail reservation)
+//   total       : 40 + fqname_len bytes
+//
+// REGISTER_REP payload layout (parsed by schema_wire_parse_register_rep):
+//
+//   offset 0 : u64 assigned_id (0 means "daemon refused"; nonzero is
+//              the id the daemon minted or the existing id if the
+//              content hash dedup'd against a prior register)
+//   total    : 8 bytes
+//
+// See:
+//   - paideia-os → design/round-retrospectives/r90-xrepo-wave3-plan.md §4
+//   - libpdx-semantic-pipe → src/registry.pdx (RESOLVE half; consumers
+//     link both files when they want both ops)
+//
+// paideia-as conformance:
+//   - Module basename PascalCase.
+//   - No `test` mnemonic — every branch uses cmp reg,imm + je / jne.
+//   - Explicit *1 scale on byte-copy index register per #1248.
+//   - r11 = scratch (paideia-as reserved).
+
+module SchemaWire = structure {
+
+  // --- Wire op codes. ---------------------------------------------------
+  pub let SR_WIRE_OP_RESOLVE_REQ  : u64 = 0x01
+  pub let SR_WIRE_OP_RESOLVE_REP  : u64 = 0x81
+  pub let SR_WIRE_OP_REGISTER_REQ : u64 = 0x02
+  pub let SR_WIRE_OP_REGISTER_REP : u64 = 0x82
+
+  // --- Wire capacities. Match libpdx-semantic-pipe.Registry byte-for-
+  //     byte so a caller linking both libraries sees one authoritative
+  //     value per constant.
+  pub let SR_WIRE_HASH_LEN     : u64 = 32
+  pub let SR_WIRE_MAX_NAME_LEN : u64 = 256
+  pub let SR_WIRE_VER          : u64 = 1
+
+  // --- Payload-layout offsets (REGISTER_REQ). --------------------------
+  pub let SR_WIRE_REQ_OFF_FQNAME_LEN  : u64 = 0
+  pub let SR_WIRE_REQ_OFF_FQNAME_BODY : u64 = 8
+  // The u64 hash at (8 + fqname_len) + 24-byte zero pad = 32-byte lane.
+
+  // --- Result codes. Sit in 400..499 to stay disjoint from
+  //     SchemaRecord's 0..8 range and from libpdx-semantic-pipe's
+  //     300..399 registry codes.
+  pub let SR_WIRE_OK               : u64 = 0
+  pub let SR_WIRE_ERR_NULL_BUF     : u64 = 400
+  pub let SR_WIRE_ERR_NULL_NAME    : u64 = 401
+  pub let SR_WIRE_ERR_NAME_RANGE   : u64 = 402
+  pub let SR_WIRE_ERR_NULL_OUT     : u64 = 403
+
+  // ============================================================================
+  // schema_wire_pack_register_req(buf_ptr, fqname_ptr, fqname_len,
+  //                                content_hash) -> u64
+  //
+  //   rdi = buf_ptr        (destination scratchpad; caller-owned; MUST
+  //                          have at least (40 + fqname_len) bytes free
+  //                          — the caller is responsible for sizing;
+  //                          this library does not know the buffer size)
+  //   rsi = fqname_ptr     (source fqname bytes)
+  //   rdx = fqname_len     (must be in [1, SR_WIRE_MAX_NAME_LEN])
+  //   rcx = content_hash   (u64 FNV-1a-64 today; the first 8 bytes of
+  //                          the 32-byte hash lane)
+  //   rax = SR_WIRE_OK              on success
+  //       | SR_WIRE_ERR_NULL_BUF    (400) if buf_ptr == 0
+  //       | SR_WIRE_ERR_NULL_NAME   (401) if fqname_ptr == 0
+  //       | SR_WIRE_ERR_NAME_RANGE  (402) if fqname_len 0 or > 256
+  //
+  // Layout written:
+  //   [0..8)                = fqname_len (u64 LE)
+  //   [8..8+fqname_len)     = fqname bytes (byte-for-byte copy)
+  //   [8+fqname_len..16+N)  = content_hash (u64 LE)
+  //   [16+N..40+N)          = 24 bytes of zero padding (BLAKE3 tail
+  //                            reservation for the future primitive swap)
+  //
+  // Total bytes written: 40 + fqname_len.
+  //
+  // Register plan (pure leaf; no callee-save touched, no nested call):
+  //   rdi = buf_ptr (preserved throughout)
+  //   rsi = fqname_ptr (byte-copy source)
+  //   rdx = fqname_len (also serves as an offset base for the hash + pad)
+  //   rcx = content_hash (staged into memory late)
+  //   rax = load/store scratch + return
+  //   r8  = per-byte scratch (zero-extended byte via xor+mov_b)
+  //   r9  = byte-copy index j
+  //   r10 = pointer scratch (buf_ptr + offset)
+  //
+  // Effects `!{mem} @{}` — pure memory write, no syscall.
+  // ============================================================================
+
+  pub let schema_wire_pack_register_req : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (buf_ptr: u64) (fqname_ptr: u64) (fqname_len: u64) (content_hash: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-schema-registry.M3-003: schema_wire_pack_register_req entry point. Inline argument gates: buf_ptr == 0 → SR_WIRE_ERR_NULL_BUF (400); fqname_ptr == 0 → SR_WIRE_ERR_NULL_NAME (401); fqname_len == 0 OR > SR_WIRE_MAX_NAME_LEN (256) → SR_WIRE_ERR_NAME_RANGE (402). Body: (1) write fqname_len at [buf_ptr + 0] via `mov [rdi], rdx`; (2) byte-copy fqname bytes: xor r9,r9 (j=0); while r9 < rdx: xor r8,r8; mov_b r8,[rsi + r9*1] (source byte, explicit *1 scale per paideia-as SIB folding #1248); mov r10, rdi; add r10, 8; add r10, r9; mov_b [r10], r8; add r9,1; loop; (3) write content_hash at [buf_ptr + 8 + fqname_len] via `mov r10, rdi; add r10, 8; add r10, rdx; mov [r10], rcx`; (4) zero the 24-byte BLAKE3 tail reservation at [buf_ptr + 16 + fqname_len]..[buf_ptr + 40 + fqname_len]: 3 x u64 zero writes via `mov r10, rdi; add r10, 16; add r10, rdx; xor rax,rax; mov [r10], rax; add r10, 8; mov [r10], rax; add r10, 8; mov [r10], rax`. Return SR_WIRE_OK (0). Pure leaf, no push/pop, no nested call. Register plan: rdi = buf_ptr (base pointer, preserved), rsi = fqname source (preserved), rdx = fqname_len (preserved), rcx = content_hash (staged late), rax = return / zero scratch, r8 = per-byte value, r9 = byte-copy index, r10 = write pointer scratch. No test mnemonic. Immediates: 0 (null-check + zero-fill + SR_WIRE_OK), 1 (loop increment + shift by 1 per SIB scale), 8 / 16 / 24 (byte-offsets within the payload — 8 for hash offset, 16 for BLAKE3 tail start, 24 not literal here but 3*8 = 24 tail bytes), 256 (SR_WIRE_MAX_NAME_LEN), 400/401/402 (error codes) — all imm32 well within 0x7FFFFFFF. Label prefix swp_ per project reserved-label discipline.",
+      block: {
+        // ---- Argument gates. -----------------------------------------
+        cmp rdi, 0;
+        je swp_null_buf;
+        cmp rsi, 0;
+        je swp_null_name;
+        cmp rdx, 0;
+        je swp_name_range;
+        cmp rdx, 256;                            // SR_WIRE_MAX_NAME_LEN
+        ja swp_name_range;
+
+        // ---- Write fqname_len at buf_ptr + 0. ------------------------
+        mov [rdi], rdx;
+
+        // ---- Byte-copy fqname into [buf_ptr + 8 .. +8 + fqname_len). -
+        xor r9, r9;                              // j = 0
+
+      swp_copy_head:
+        cmp r9, rdx;
+        jae swp_copy_done;
+
+        xor r8, r8;
+        mov_b r8, [rsi + r9 * 1];                // source byte
+
+        mov r10, rdi;
+        add r10, 8;
+        add r10, r9;                             // buf_ptr + 8 + j
+        mov_b [r10], r8;
+
+        add r9, 1;
+        jmp swp_copy_head;
+
+      swp_copy_done:
+        // ---- Write content_hash at buf_ptr + 8 + fqname_len. ---------
+        mov r10, rdi;
+        add r10, 8;
+        add r10, rdx;
+        mov [r10], rcx;
+
+        // ---- Zero 24 bytes of BLAKE3 tail at buf_ptr + 16 + fqname_len. -
+        mov r10, rdi;
+        add r10, 16;
+        add r10, rdx;
+        xor rax, rax;
+        mov [r10], rax;
+        add r10, 8;
+        mov [r10], rax;
+        add r10, 8;
+        mov [r10], rax;
+
+        xor rax, rax;                            // SR_WIRE_OK
+        ret;
+
+      swp_null_buf:
+        mov rax, 400;                            // SR_WIRE_ERR_NULL_BUF
+        ret;
+
+      swp_null_name:
+        mov rax, 401;                            // SR_WIRE_ERR_NULL_NAME
+        ret;
+
+      swp_name_range:
+        mov rax, 402;                            // SR_WIRE_ERR_NAME_RANGE
+        ret;
+      }
+    }
+
+  // ============================================================================
+  // schema_wire_parse_register_rep(buf_ptr, out_id_ptr) -> u64
+  //
+  //   rdi = buf_ptr     (source scratchpad containing the reply payload
+  //                       — caller-owned; MUST hold at least 8 bytes)
+  //   rsi = out_id_ptr  (destination for the assigned id; nullable —
+  //                       0 means "don't write, only return the id in
+  //                       rax as a status-plus-value")
+  //   rax = assigned id (>0)              on success
+  //       | SR_WIRE_ERR_NULL_BUF (400)    if buf_ptr == 0
+  //       | 0                             if the daemon minted id 0
+  //                                        (refusal sentinel)
+  //
+  // The parse is trivial — the REGISTER_REP payload is a single u64 —
+  // but factoring the read here keeps the wire layout in one place so
+  // a future primitive swap (e.g. widening the id from u64 to a
+  // {(pid<<32)|local} composite matching libpdx-audit's #12 audit_id
+  // discipline) is a single-file change.
+  //
+  // Register plan (pure leaf, no callee-save touched):
+  //   rdi = buf_ptr (input)
+  //   rsi = out_id_ptr (input)
+  //   rax = load / return
+  // ============================================================================
+
+  pub let schema_wire_parse_register_rep : (u64, u64) -> u64 !{mem} @{} =
+    fn (buf_ptr: u64) (out_id_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-schema-registry.M3-003: schema_wire_parse_register_rep entry point. Gate: buf_ptr == 0 → SR_WIRE_ERR_NULL_BUF (400). Body: load u64 at [buf_ptr] into rax (the assigned id). NULL-tolerant out: `cmp rsi, 0; je swpp_skip; mov [rsi], rax; swpp_skip:`. Return rax verbatim — the caller checks for nonzero to distinguish success from the daemon's 0-refusal sentinel. Pure leaf, no push/pop, no nested call. Register plan: rdi = buf_ptr, rsi = out_id_ptr, rax = load / return, no scratch beyond that. No test mnemonic. Immediates: 0 (null-check), 400 (SR_WIRE_ERR_NULL_BUF). Label prefix swpp_ per project reserved-label discipline.",
+      block: {
+        cmp rdi, 0;
+        je swpp_null_buf;
+
+        mov rax, [rdi];                          // id
+        cmp rsi, 0;
+        je swpp_skip;
+        mov [rsi], rax;
+
+      swpp_skip:
+        ret;
+
+      swpp_null_buf:
+        mov rax, 400;                            // SR_WIRE_ERR_NULL_BUF
+        ret;
+      }
+    }
+}

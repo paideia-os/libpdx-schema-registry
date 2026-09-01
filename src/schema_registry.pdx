@@ -475,4 +475,90 @@ module SchemaRegistry = structure {
         ret;
       }
     }
+
+  // ============================================================================
+  // schema_list(out_ids_ptr, max_count) -> u64
+  //   rdi = out_ids_ptr      (nullable when max_count == 0)
+  //   rsi = max_count        (0 = probe mode: return count without copy)
+  //   rax = count of ids written (write mode) OR count of OCCUPIED
+  //         slots (probe mode). Both capped at SR_MAX_SCHEMAS (32).
+  //
+  // Walks schema_slot_state in ordinal 0..SR_MAX_SCHEMAS order and, for
+  // each OCCUPIED slot, writes the slot's schema_id[i] as a u64 into
+  // out_ids_ptr[written] until either the catalog is exhausted or
+  // written == max_count. Written count is the return value.
+  //
+  // Probe mode (rsi == 0): the write is short-circuited but the counter
+  // still increments for every OCCUPIED slot, so the return value is
+  // the total occupied count. A caller sizing a receive buffer can
+  // therefore call schema_list(0, 0) first, allocate that many u64
+  // slots, then call schema_list(buf, count).
+  //
+  // Not gated on the M3 audit/elevate machinery — list is a read-side
+  // op and the plan treats the catalog as public-read.
+  //
+  // Register plan (pure leaf; no push/pop, no callee-save touched):
+  //   rdi = out_ids_ptr (input)
+  //   rsi = max_count (input)
+  //   rcx = i (outer slot counter)
+  //   r8  = written / occupied counter (return value)
+  //   rax = load / return
+  //   r10, r11 = pointer arithmetic scratch
+  //
+  // Effects `!{mem} @{}` — read plus optional write into caller buffer.
+  // ============================================================================
+
+  pub let schema_list : (u64, u64) -> u64 !{mem} @{} =
+    fn (out_ids_ptr: u64) (max_count: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-schema-registry.M2-004: schema_list entry point. Pure leaf, no push/pop, no callee-save touched. Register plan: rdi = out_ids_ptr, rsi = max_count, rcx = i (slot counter), r8 = result counter (return value), rax/r10/r11 = scratch. Walks rcx = 0..SR_MAX_SCHEMAS (32) loading schema_slot_state[i] via the standard `lea r11,[rip+base]; mov r10,rcx; shl r10,3; add r10,r11; mov rax,[r10]` idiom. On !OCCUPIED, advance. On OCCUPIED: branch on rsi == 0 (probe mode: `cmp rsi, 0; je snm_count_only`) — probe path skips the write and jumps to r8 += 1 unconditionally, so a probe returns the total occupied count. Write mode: `cmp r8, rsi; jae snm_advance` — stop counting AND writing once capacity is reached, so max_count effectively caps the return value at min(occupied, max_count). Write: load schema_id[i] into rax, compute out_ids_ptr[written] via `mov r10,r8; shl r10,3; add r10,rdi; mov [r10],rax`. Fall through to snm_count_only: `add r8, 1`. Advance: `add rcx, 1; jmp snm_head`. Done: `mov rax, r8; ret`. No test mnemonic. Immediates: 0 (probe-mode gate + SR_SLOT_EMPTY-derived state test), 1 (SR_SLOT_OCCUPIED / increment), 3 (shl bit count), 32 (SR_MAX_SCHEMAS bound) — all imm8. Label prefix snm_ per project reserved-label discipline (snl_ is already taken by schema_lookup so a second unique prefix keeps the linker's local-label table conflict-free).",
+      block: {
+        xor rcx, rcx;                            // i = 0
+        xor r8, r8;                              // result counter = 0
+
+      snm_head:
+        cmp rcx, 32;                             // SR_MAX_SCHEMAS
+        jae snm_done;
+
+        // schema_slot_state[i]
+        lea r11, [rip + schema_slot_state];
+        mov r10, rcx;
+        shl r10, 3;
+        add r10, r11;
+        mov rax, [r10];
+        cmp rax, 1;                              // SR_SLOT_OCCUPIED
+        jne snm_advance;
+
+        // Probe mode: skip the write, count only.
+        cmp rsi, 0;
+        je snm_count_only;
+
+        // Write mode: cap at max_count.
+        cmp r8, rsi;
+        jae snm_advance;
+
+        // out_ids_ptr[r8] = schema_id[i]
+        lea r11, [rip + schema_id];
+        mov r10, rcx;
+        shl r10, 3;
+        add r10, r11;
+        mov rax, [r10];                          // rax = id
+
+        mov r10, r8;
+        shl r10, 3;
+        add r10, rdi;                            // &out_ids_ptr[r8]
+        mov [r10], rax;
+
+      snm_count_only:
+        add r8, 1;
+
+      snm_advance:
+        add rcx, 1;
+        jmp snm_head;
+
+      snm_done:
+        mov rax, r8;
+        ret;
+      }
+    }
 }
